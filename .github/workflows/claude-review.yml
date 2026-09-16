@@ -1,0 +1,201 @@
+name: Claude Code PR review
+
+on:
+  workflow_call:
+    inputs:
+      source_repository:
+        description: Public OCR fork containing the CLI and composite Action.
+        type: string
+        required: true
+      source_sha:
+        description: Full commit SHA of the trusted OCR fork; pin the caller uses reference to the same SHA.
+        type: string
+        required: true
+      model:
+        description: Claude CLI model; overrides the caller repository or organization OCR_MODEL variable.
+        type: string
+        default: ''
+      gateway_url:
+        description: HTTPS gateway URL; falls back to the caller repository or organization OCR_GATEWAY_URL variable.
+        type: string
+        default: ''
+      claude_version:
+        description: Exact Claude Code npm version, not a moving tag or version range.
+        type: string
+        default: '2.1.273'
+      effort:
+        description: OCR review effort (low, medium, high).
+        type: string
+        default: low
+      review_concurrency:
+        description: Maximum parallel OCR review tasks within this run.
+        type: string
+        default: '1'
+      max_tokens_budget:
+        description: Total review token cap; an incomplete budget-limited review fails the check.
+        type: string
+        default: '500000'
+    secrets:
+      gateway_token:
+        description: Gateway credential passed only to the composite Action review step.
+        required: true
+    outputs:
+      summary_comment_url:
+        description: URL of the PR review summary.
+        value: ${{ jobs.review.outputs.summary_comment_url }}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    # Only trusted base workflows on internal, human-authored PRs may spend quota.
+    # External PRs require a separately designed maintainer-authorized entry point.
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      summary_comment_url: ${{ steps.review.outputs.summary_comment_url }}
+    steps:
+      - name: Validate workflow configuration
+        id: settings
+        shell: bash
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          MODEL: ${{ inputs.model || vars.OCR_MODEL || 'claude-gpt-6-astra' }}
+          GATEWAY_URL: ${{ inputs.gateway_url || vars.OCR_GATEWAY_URL }}
+          CLAUDE_VERSION: ${{ inputs.claude_version }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const values = {
+            source_repository: process.env.SOURCE_REPOSITORY,
+            source_sha: process.env.SOURCE_SHA,
+            model: process.env.MODEL,
+            gateway_url: process.env.GATEWAY_URL,
+            claude_version: process.env.CLAUDE_VERSION,
+          };
+          function fail(message) { console.error(message); process.exit(1); }
+          for (const [name, value] of Object.entries(values)) {
+            if (!value || value.trim() !== value || /[\x00-\x1f\x7f]/.test(value)) {
+              fail(`${name} must be nonempty, single-line, and have no surrounding whitespace`);
+            }
+          }
+          if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(values.source_repository)) {
+            fail('source_repository must be an owner/repository name');
+          }
+          if (!/^[a-fA-F0-9]{40}$/.test(values.source_sha)) {
+            fail('source_sha must be a full 40-character commit SHA');
+          }
+          values.source_sha = values.source_sha.toLowerCase();
+          if (!/^\d+\.\d+\.\d+$/.test(values.claude_version)) {
+            fail('claude_version must be an exact release version');
+          }
+          let gateway;
+          try { gateway = new URL(values.gateway_url); } catch { fail('gateway_url must be an HTTPS URL'); }
+          if (gateway.protocol !== 'https:' || gateway.username || gateway.password || gateway.search || gateway.hash) {
+            fail('gateway_url must use HTTPS without credentials, query, or fragment');
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT,
+            Object.entries(values).map(([name, value]) => `${name}=${value}\n`).join(''));
+          NODE
+
+      - name: Checkout trusted review base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          # The Action still needs to fetch PR objects, including in private repos.
+          # Checkout removes these credentials in its post-job cleanup.
+          persist-credentials: true
+
+      - name: Checkout pinned OCR tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.settings.outputs.source_repository }}
+          ref: ${{ steps.settings.outputs.source_sha }}
+          path: .ocr-tooling
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: .ocr-tooling/go.mod
+          cache: false
+
+      - name: Build pinned OCR
+        working-directory: .ocr-tooling
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.settings.outputs.source_sha }}
+          CGO_ENABLED: '0'
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          # Upstream compatibility version plus immutable fork identity. Forks need
+          # no release tags (pushing those could trigger upstream publishing jobs).
+          make build VERSION="v1.12.2+fork.${SOURCE_SHA}"
+          ./dist/opencodereview --version
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install pinned Claude Code
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        env:
+          CLAUDE_VERSION: ${{ steps.settings.outputs.claude_version }}
+        run: |
+          npm install --prefix "$RUNNER_TEMP/ocr-claude" --no-audit --no-fund \
+            --registry https://registry.npmjs.org/ "@anthropic-ai/claude-code@${CLAUDE_VERSION}"
+          "$RUNNER_TEMP/ocr-claude/node_modules/.bin/claude" --version
+          printf '%s\n' "$RUNNER_TEMP/ocr-claude/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Review and publish findings
+        id: review
+        uses: ./.ocr-tooling
+        env:
+          ANTHROPIC_BASE_URL: ${{ steps.settings.outputs.gateway_url }}
+          # Do not inherit alternate API authentication into the gateway backend.
+          ANTHROPIC_API_KEY: ''
+          CLAUDE_CODE_USE_GATEWAY: '1'
+          CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '1'
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000'
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+          API_TIMEOUT_MS: '30000'
+          OCR_NO_UPDATE: '1'
+        with:
+          provider: claude-code
+          ocr_binary: ${{ github.workspace }}/.ocr-tooling/dist/opencodereview
+          skip_checkout: 'true'
+          require_complete: 'true'
+          llm_model: ${{ steps.settings.outputs.model }}
+          claude_auth_token: ${{ secrets.gateway_token }}
+          github_token: ${{ github.token }}
+          effort: ${{ inputs.effort }}
+          review_concurrency: ${{ inputs.review_concurrency }}
+          max_tokens_budget: ${{ inputs.max_tokens_budget }}
+          sticky_summary: 'true'
+          incremental: 'true'
+          checkpoint_range: 'false'
+          upload_artifacts: 'true'
+
+      - name: Verify review publication
+        shell: bash
+        env:
+          COMMENTS_FAILED: ${{ steps.review.outputs.comments_failed }}
+          SUMMARY_URL: ${{ steps.review.outputs.summary_comment_url }}
+        run: |
+          if [[ "$COMMENTS_FAILED" != "0" || -z "$SUMMARY_URL" ]]; then
+            printf '%s\n' 'Review publication was incomplete; inspect the Action logs and result artifacts.' >&2
+            exit 1
+          fi

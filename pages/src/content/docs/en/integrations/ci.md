@@ -54,6 +54,54 @@ for free via `GITHUB_TOKEN`; GitLab recommends an explicit
 fallback for fork MRs (it can post discussions via `/discussions`) —
 a dedicated token is recommended for reliability.
 
+## Claude Code gateways on GitHub
+
+For the `claude-code` provider, use the fork's
+`.github/workflows/claude-review.yml` reusable workflow and copy the caller from
+`examples/github_actions/claude-code.yml`. This path builds a pinned public fork
+commit and installs a pinned Claude Code CLI; it does **not** install OCR from
+the upstream npm package or configure a direct model API. No MCP server or Claude
+GitHub App is needed.
+
+After pushing the implementation, replace both `REPLACE_WITH_COMMIT_SHA` values
+in the example with the same full fork commit SHA. Set the fork repository in
+both `uses:` and `source_repository`, and add the organization/repository Actions
+secret `OCR_GATEWAY_AUTH_TOKEN` with access limited to participating repositories.
+Set `gateway_url` in YAML, or supply the Actions variable `OCR_GATEWAY_URL`.
+The workflow passes the credential only to the CLI review process; GitHub runners
+do not inherit your local login or shell exports.
+
+Model selection is configurable without changing the central workflow:
+
+| Priority | Setting |
+| --- | --- |
+| 1 | Explicit `with.model` in the caller CI YAML |
+| 2 | Repository or organization Actions variable `OCR_MODEL` |
+| 3 | `claude-gpt-6-astra` |
+
+Use `model: default` for Claude Code's own default, or pass another supported model
+identifier/alias unchanged. Ordinary caller `env:` values do not propagate into
+reusable workflows. For a direct composite Action step, an environment variable
+can instead be passed as `llm_model: ${{ env.OCR_MODEL }}`.
+
+The initial workflow runs only for internal, non-draft, human-authored
+`pull_request_target` PRs. It checks out the trusted base revision and reads PR
+Git objects without executing PR code. Merge the caller into the default branch
+before testing it. External PRs, bots, comment triggers, and manual dispatch are
+not enabled; do not bypass these guards to make credentials available.
+
+Findings are advisory, but malformed, incomplete, failed, or budget-limited reviews
+fail the check, as do incomplete comment publication and missing summaries. A
+valid empty selection succeeds. Results/stderr are retained as Actions artifacts
+and may contain private code. Start with one non-required pilot check, then add
+other repositories after verification. See `examples/github_actions/README.md`
+in the fork for the full deployment instructions, trust boundaries, input list,
+and model examples.
+
+The composite Action's `provider`, `ocr_binary`, `claude_auth_token`,
+`skip_checkout`, and `require_complete` inputs support custom workflows too.
+Empty `provider` and `ocr_binary` preserve the HTTP/npm integration below.
+
 ## GitHub Actions
 
 The upstream workflow lives at

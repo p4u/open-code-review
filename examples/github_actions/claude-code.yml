@@ -1,0 +1,33 @@
+# Copy to .github/workflows/ocr-review.yml in a consumer repository.
+# Replace BOTH REPLACE_WITH_COMMIT_SHA values with the same full fork commit SHA.
+# Add OCR_GATEWAY_AUTH_TOKEN as an Actions secret accessible to this repository.
+# Optional Actions variable OCR_MODEL chooses the model without editing this file.
+name: OCR review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ocr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: >-
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type != 'Bot'
+    uses: p4u/open-code-review/.github/workflows/claude-review.yml@REPLACE_WITH_COMMIT_SHA
+    with:
+      source_repository: p4u/open-code-review
+      source_sha: REPLACE_WITH_COMMIT_SHA
+      gateway_url: https://claude.vocdoni.net
+      # Uncomment to override the repository/organization OCR_MODEL variable:
+      # model: claude-gpt-6-astra
+    secrets:
+      gateway_token: ${{ secrets.OCR_GATEWAY_AUTH_TOKEN }}

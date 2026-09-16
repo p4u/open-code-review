@@ -8,31 +8,50 @@ branding:
   color: green
 
 inputs:
+  provider:
+    description: >-
+      Empty preserves the legacy HTTP configuration. claude-code uses an
+      installed Claude Code CLI and its authentication. Other values are rejected.
+      HTTP-only inputs are ignored; llm_model and llm_timeout still apply.
+    required: false
+    default: ''
+  ocr_binary:
+    description: >-
+      Absolute path to a trusted, preinstalled OCR executable. Skips npm entirely;
+      the executable must support the selected provider and the version gates.
+    required: false
+    default: ''
+  claude_auth_token:
+    description: >-
+      Optional Claude gateway credential. Passed as ANTHROPIC_AUTH_TOKEN only to
+      the claude-code review step, never persisted. Empty inherits CLI authentication.
+    required: false
+    default: ''
   llm_url:
-    description: LLM API endpoint URL (mapped to env OCR_LLM_URL).
-    required: true
+    description: HTTP-only LLM API endpoint URL (mapped to env OCR_LLM_URL).
+    required: false
   llm_auth_token:
-    description: LLM auth token (mapped to env OCR_LLM_TOKEN).
-    required: true
+    description: HTTP-only LLM auth token (mapped to env OCR_LLM_TOKEN).
+    required: false
   llm_model:
     description: Model name (mapped to env OCR_LLM_MODEL).
     required: true
   llm_use_anthropic:
     description: >-
-      Selects the LLM protocol (mapped to env OCR_USE_ANTHROPIC). An explicitly supplied empty
+      HTTP-only protocol selection (mapped to env OCR_USE_ANTHROPIC). An explicitly supplied empty
       string, true, 1, or yes selects Anthropic
       case-insensitively; every other value selects the OpenAI-compatible
       protocol, preserving the CLI environment contract.
-    required: true
+    required: false
   llm_auth_header:
-    description: Custom auth header name (mapped to env OCR_LLM_AUTH_HEADER).
+    description: HTTP-only custom auth header name (mapped to env OCR_LLM_AUTH_HEADER).
     required: false
   llm_extra_headers:
-    description: Extra headers "K=V,K=V" (mapped to env OCR_LLM_EXTRA_HEADERS).
+    description: HTTP-only extra headers "K=V,K=V" (mapped to env OCR_LLM_EXTRA_HEADERS).
     required: false
   llm_extra_body:
     description: >-
-      extra_body JSON for LLM requests. No env var exists for this, so it is
+      HTTP-only extra_body JSON for LLM requests. No env var exists for this, so it is
       written via `ocr config set llm.extra_body`. The default disables
       thinking mode for compatibility with various LLM providers; override it
       with provider-specific JSON when a model needs different behavior. An
@@ -42,7 +61,7 @@ inputs:
     default: '{"thinking": {"type": "disabled"}}'
   llm_reasoning_effort:
     description: >-
-      Reasoning depth for the model (one of: minimal, low, medium, high, max;
+      HTTP-only reasoning depth for the model (one of: minimal, low, medium, high, max;
       case-insensitive), merged into the request body as reasoning_effort via
       llm.extra_body — no CLI support beyond the published versions is needed.
       OpenAI-compatible protocols only (e.g. GLM-5.x, OpenAI reasoning
@@ -187,6 +206,20 @@ inputs:
       without turning checkpointing off; the run still records a new checkpoint.
     required: false
     default: 'false'
+  require_complete:
+    description: >-
+      Literal 'true' or 'false'. Require valid JSON with complete review coverage
+      before posting. Findings are not failures; incomplete or failed work is.
+    required: false
+    default: 'false'
+  skip_checkout:
+    description: >-
+      Literal 'true' or 'false'. Skip the action's checkout when the caller has
+      already checked out the trusted base at the workspace root, before installing
+      a local action/tooling subdirectory. On PR events HEAD must equal base.sha.
+      For issue_comment the caller must check out the trusted default/base branch.
+    required: false
+    default: 'false'
   base_ref:
     description: >-
       Override the base ref. Provide this (and head_sha) when invoking from a
@@ -271,6 +304,35 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Validate transport and checkout
+      shell: bash
+      env:
+        OCR_PROVIDER_INPUT: ${{ inputs.provider }}
+        SKIP_CHECKOUT_INPUT: ${{ inputs.skip_checkout }}
+        REQUIRE_COMPLETE_INPUT: ${{ inputs.require_complete }}
+      run: |
+        case "$OCR_PROVIDER_INPUT" in
+          ""|claude-code) ;;
+          *)
+            echo "::error::provider must be empty (legacy HTTP) or claude-code"
+            exit 1
+            ;;
+        esac
+        case "$SKIP_CHECKOUT_INPUT" in
+          true|false) ;;
+          *)
+            echo "::error::skip_checkout must be the literal string 'true' or 'false'"
+            exit 1
+            ;;
+        esac
+        case "$REQUIRE_COMPLETE_INPUT" in
+          true|false) ;;
+          *)
+            echo "::error::require_complete must be the literal string 'true' or 'false'"
+            exit 1
+            ;;
+        esac
+
     - name: Check git and Node.js
       id: check_deps
       shell: bash
@@ -325,19 +387,41 @@ runs:
       run: |
         BASE_REF="${INPUT_BASE_REF:-$EVENT_BASE_REF}"
         HEAD_SHA="${INPUT_HEAD_SHA:-$EVENT_HEAD_SHA}"
+        if ! git check-ref-format "refs/heads/$BASE_REF" >/dev/null 2>&1 ||
+          [[ "$BASE_REF" == -* || "$BASE_REF" =~ [[:cntrl:]] ]] ||
+          [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+          echo "::error::A valid base_ref and full 40-character head_sha are required"
+          exit 1
+        fi
         echo "BASE_REF=$BASE_REF" >> "$GITHUB_ENV"
         echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
         echo "PR base ref: $BASE_REF"
         echo "PR head sha: $HEAD_SHA"
 
     - name: Checkout base
+      if: inputs.skip_checkout != 'true'
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        # Checkout the trusted base, not the PR head. OCR reviews the
-        # base-to-head diff from git objects; the head commit's blobs are
-        # fetched separately so they are resolvable without materializing
-        # untrusted PR files into the working tree.
+        # Explicit even on pull_request (whose default checkout is the merge
+        # commit). issue_comment has no base.sha and keeps its default-base
+        # checkout. Fetch head objects below without materializing PR files.
+        ref: ${{ github.event.pull_request.base.sha }}
         fetch-depth: 0
+
+    - name: Verify trusted checkout
+      shell: bash
+      env:
+        EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        # Also enforce this when the caller skipped checkout to preserve a local
+        # action/tooling directory. Never run tooling from the PR head checkout.
+        if [ -n "$EVENT_BASE_SHA" ]; then
+          if [[ ! "$EVENT_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] ||
+            [ "$(git rev-parse --verify HEAD)" != "$EVENT_BASE_SHA" ]; then
+            echo "::error::The workspace HEAD must equal the trusted pull request base.sha"
+            exit 1
+          fi
+        fi
 
     - name: Fetch PR head (fork-safe)
       if: env.HEAD_SHA != ''
@@ -352,13 +436,18 @@ runs:
     - name: Compute merge-base
       shell: bash
       run: |
-        git fetch origin "${BASE_REF}" 2>/dev/null || true
-        MERGE_BASE=$(git merge-base "origin/${BASE_REF}" "${HEAD_SHA}" 2>/dev/null || echo "${HEAD_SHA}")
+        git fetch origin "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+        if ! MERGE_BASE=$(git merge-base "refs/remotes/origin/${BASE_REF}" "${HEAD_SHA}") ||
+          [[ ! "$MERGE_BASE" =~ ^[0-9a-fA-F]{40}$ ]]; then
+          echo "::error::Unable to compute a merge-base; refusing to review an empty or unverified range"
+          exit 1
+        fi
         echo "MERGE_BASE=$MERGE_BASE" >> "$GITHUB_ENV"
         echo "Reviewing ${HEAD_SHA} from merge-base ${MERGE_BASE} (base origin/${BASE_REF})"
 
     - name: Validate inputs
       env:
+        OCR_PROVIDER_INPUT: ${{ inputs.provider }}
         REVIEW_TASK_TIMEOUT: ${{ inputs.review_task_timeout }}
         EFFORT_INPUT: ${{ inputs.effort }}
         MAX_TOKENS_BUDGET_INPUT: ${{ inputs.max_tokens_budget }}
@@ -419,6 +508,10 @@ runs:
         # OpenAI and GLM vocabularies, normalized to lowercase for the
         # extra_body injection in the Configure OCR step (which uses node,
         # guaranteed on PATH by the Actions runtime).
+        # All HTTP-only settings, including this one, are ignored by claude-code.
+        if [ "$OCR_PROVIDER_INPUT" = "claude-code" ]; then
+          LLM_REASONING_EFFORT_INPUT=""
+        fi
         NORMALIZED_LLM_REASONING_EFFORT="$(printf '%s' "$LLM_REASONING_EFFORT_INPUT" | tr '[:upper:]' '[:lower:]')"
         case "$NORMALIZED_LLM_REASONING_EFFORT" in
           ""|minimal|low|medium|high|max) ;;
@@ -448,10 +541,30 @@ runs:
       shell: bash
       env:
         OCR_VERSION: ${{ inputs.ocr_version }}
+        OCR_BINARY_INPUT: ${{ inputs.ocr_binary }}
       run: |
-        npm install -g "@alibaba-group/open-code-review@${OCR_VERSION}"
-        echo "OpenCodeReview installed:"
-        OCR_VERSION_OUTPUT="$(ocr version 2>/dev/null)" || {
+        export OCR_NO_UPDATE=1
+        if [ -n "$OCR_BINARY_INPUT" ]; then
+          # Treat this as one executable path, never a shell command. The caller
+          # owns its provenance; paths with spaces and executable symlinks work.
+          if [[ "$OCR_BINARY_INPUT" != /* || "$OCR_BINARY_INPUT" =~ [[:cntrl:]] ]] ||
+            [ ! -f "$OCR_BINARY_INPUT" ] || [ ! -x "$OCR_BINARY_INPUT" ]; then
+            echo "::error::ocr_binary must be an absolute path to a trusted executable file (no control characters)"
+            exit 1
+          fi
+          OCR_EXECUTABLE="$OCR_BINARY_INPUT"
+        else
+          npm install -g "@alibaba-group/open-code-review@${OCR_VERSION}"
+          OCR_EXECUTABLE="$(command -v ocr)"
+        fi
+        if [[ "$OCR_EXECUTABLE" != /* || "$OCR_EXECUTABLE" =~ [[:cntrl:]] ]] ||
+          [ ! -f "$OCR_EXECUTABLE" ] || [ ! -x "$OCR_EXECUTABLE" ]; then
+          echo "::error::Unable to locate an absolute OpenCodeReview executable path"
+          exit 1
+        fi
+        echo "OCR_EXECUTABLE=$OCR_EXECUTABLE" >> "$GITHUB_ENV"
+        echo "OpenCodeReview selected:"
+        OCR_VERSION_OUTPUT="$("$OCR_EXECUTABLE" version 2>/dev/null)" || {
           echo "::error::Unable to read the installed OpenCodeReview version"
           exit 1
         }
@@ -500,7 +613,9 @@ runs:
         echo "OCR_VERSION_ACTUAL=${VERSION_ACTUAL}" >> "$GITHUB_ENV"
 
     - name: Configure OCR
+      id: configure_ocr
       env:
+        OCR_PROVIDER_INPUT: ${{ inputs.provider }}
         OCR_LLM_URL: ${{ inputs.llm_url }}
         OCR_LLM_MODEL: ${{ inputs.llm_model }}
         OCR_USE_ANTHROPIC: ${{ inputs.llm_use_anthropic }}
@@ -509,6 +624,24 @@ runs:
         OCR_LANGUAGE: ${{ inputs.language }}
       shell: bash
       run: |
+        export OCR_NO_UPDATE=1
+        if [ -z "$OCR_LLM_MODEL" ]; then
+          echo "::error::llm_model is required"
+          exit 1
+        fi
+        if [ "$OCR_PROVIDER_INPUT" = "claude-code" ]; then
+          # OCR_CONFIG_PATH is not honored by config/review. An isolated HOME
+          # prevents stale providers, credential commands and OCR MCP servers
+          # from being loaded, without modifying the caller's saved settings.
+          OCR_ACTION_HOME="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ocr-action-home.XXXXXX")"
+          echo "home=$OCR_ACTION_HOME" >> "$GITHUB_OUTPUT"
+          HOME="$OCR_ACTION_HOME" "$OCR_EXECUTABLE" config set language "$OCR_LANGUAGE"
+          exit 0
+        fi
+        if [ -z "$OCR_LLM_URL" ]; then
+          echo "::error::llm_url is required for the legacy HTTP provider"
+          exit 1
+        fi
         NORMALIZED_USE_ANTHROPIC="$(printf '%s' "$OCR_USE_ANTHROPIC" | tr '[:upper:]' '[:lower:]')"
         case "$NORMALIZED_USE_ANTHROPIC" in
           ""|true|1|yes)
@@ -528,16 +661,16 @@ runs:
           echo "::error::llm_reasoning_effort is supported only with OpenAI-compatible protocols"
           exit 1
         fi
-        ocr config unset provider
-        ocr config set llm.auth_token ""
-        ocr config set llm.extra_headers ""
-        ocr config set llm.retry_codes ""
-        ocr config set llm.url "$OCR_LLM_URL"
-        ocr config set llm.model "$OCR_LLM_MODEL"
-        ocr config set llm.use_anthropic "$OCR_USE_ANTHROPIC"
-        ocr config set llm.protocol "$OCR_LLM_PROTOCOL"
-        ocr config set llm.auth_header "$OCR_LLM_AUTH_HEADER"
-        ocr config set llm.auth_token_cmd 'printf "%s" "$OCR_LLM_TOKEN"'
+        "$OCR_EXECUTABLE" config unset provider
+        "$OCR_EXECUTABLE" config set llm.auth_token ""
+        "$OCR_EXECUTABLE" config set llm.extra_headers ""
+        "$OCR_EXECUTABLE" config set llm.retry_codes ""
+        "$OCR_EXECUTABLE" config set llm.url "$OCR_LLM_URL"
+        "$OCR_EXECUTABLE" config set llm.model "$OCR_LLM_MODEL"
+        "$OCR_EXECUTABLE" config set llm.use_anthropic "$OCR_USE_ANTHROPIC"
+        "$OCR_EXECUTABLE" config set llm.protocol "$OCR_LLM_PROTOCOL"
+        "$OCR_EXECUTABLE" config set llm.auth_header "$OCR_LLM_AUTH_HEADER"
+        "$OCR_EXECUTABLE" config set llm.auth_token_cmd 'printf "%s" "$OCR_LLM_TOKEN"'
         # reasoning_effort rides the existing extra_body merge, so any
         # published CLI version supports it. An explicit reasoning_effort key
         # in llm_extra_body wins over the input — the hand-written body is the
@@ -568,8 +701,8 @@ runs:
               process.stdout.write(JSON.stringify(body));
             });')"
         fi
-        ocr config set llm.extra_body "$EFFECTIVE_EXTRA_BODY"
-        ocr config set language "$OCR_LANGUAGE"
+        "$OCR_EXECUTABLE" config set llm.extra_body "$EFFECTIVE_EXTRA_BODY"
+        "$OCR_EXECUTABLE" config set language "$OCR_LANGUAGE"
 
     - name: Resolve review range
       if: inputs.checkpoint_range == 'true'
@@ -602,6 +735,7 @@ runs:
         # value ever containing the separator — and a value that does contain it
         # shifts the field boundaries, so two different configurations can hash
         # alike and a checkpoint survives a change that should have killed it.
+        OCR_FP_PROVIDER: ${{ inputs.provider }}
         OCR_FP_LLM_URL: ${{ inputs.llm_url }}
         OCR_FP_LLM_MODEL: ${{ inputs.llm_model }}
         OCR_FP_LLM_USE_ANTHROPIC: ${{ inputs.llm_use_anthropic }}
@@ -744,6 +878,7 @@ runs:
             // configurations hash alike.
             const fingerprint = !versionActual ? '' : crypto.createHash('sha256')
               .update(JSON.stringify([
+                process.env.OCR_FP_PROVIDER,
                 process.env.OCR_FP_LLM_URL,
                 process.env.OCR_FP_LLM_MODEL,
                 process.env.OCR_FP_LLM_USE_ANTHROPIC,
@@ -819,6 +954,9 @@ runs:
 
     - name: Run OpenCodeReview
       env:
+        OCR_PROVIDER_INPUT: ${{ inputs.provider }}
+        OCR_ACTION_HOME: ${{ steps.configure_ocr.outputs.home }}
+        CLAUDE_AUTH_TOKEN_INPUT: ${{ inputs.claude_auth_token }}
         OCR_LLM_URL: ${{ inputs.llm_url }}
         OCR_LLM_TOKEN: ${{ inputs.llm_auth_token }}
         OCR_LLM_MODEL: ${{ inputs.llm_model }}
@@ -835,12 +973,33 @@ runs:
         RANGE_FROM: ${{ steps.range.outputs.range_from }}
       shell: bash
       run: |
+        export OCR_NO_UPDATE=1
         export OCR_LLM_TIMEOUT="${OCR_LLM_TIMEOUT:-300}"
         if [ -z "${REVIEW_TASK_TIMEOUT:-}" ]; then
           echo "::error::Validated review_task_timeout is missing; the Validate inputs step must complete first"
           exit 1
         fi
         ARGS=(--from "${RANGE_FROM:-$MERGE_BASE}" --to "${HEAD_SHA}")
+        if [ "$OCR_PROVIDER_INPUT" = "claude-code" ]; then
+          if [ -z "$OCR_ACTION_HOME" ] || [ ! -d "$OCR_ACTION_HOME" ]; then
+            echo "::error::Isolated claude-code configuration is missing; Configure OCR must complete first"
+            exit 1
+          fi
+          ARGS+=(--provider claude-code --model "$OCR_LLM_MODEL")
+          # Preserve existing Claude authentication/settings and Git safe.directory
+          # while isolating OCR's own config and MCP servers. HOME is step-local.
+          export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+          export GIT_CONFIG_GLOBAL="${GIT_CONFIG_GLOBAL:-$HOME/.gitconfig}"
+          export HOME="$OCR_ACTION_HOME"
+          unset OCR_LLM_URL OCR_LLM_TOKEN OCR_USE_ANTHROPIC OCR_LLM_AUTH_HEADER OCR_LLM_EXTRA_HEADERS
+          if [ -n "$CLAUDE_AUTH_TOKEN_INPUT" ]; then
+            export ANTHROPIC_AUTH_TOKEN="$CLAUDE_AUTH_TOKEN_INPUT"
+          fi
+        elif [ -z "$OCR_LLM_TOKEN" ]; then
+          echo "::error::llm_auth_token is required for the legacy HTTP provider"
+          exit 1
+        fi
+        unset CLAUDE_AUTH_TOKEN_INPUT
         # stream_progress 'false' (default): agent audience, stderr captured to
         # the log file without a live tee. Opt-in 'true': no --audience agent,
         # so human-audience routing sends [ocr] progress lines to stderr; a
@@ -862,12 +1021,12 @@ runs:
           mkfifo "$OCR_STDERR_FIFO" || exit 1
           tee /tmp/ocr-stderr.log < "$OCR_STDERR_FIFO" >&2 &
           TEE_PID=$!
-          ocr review "${ARGS[@]}" > /tmp/ocr-result.json 2> "$OCR_STDERR_FIFO"
+          "$OCR_EXECUTABLE" review "${ARGS[@]}" > /tmp/ocr-result.json 2> "$OCR_STDERR_FIFO"
           OCR_EXIT_CODE=$?
           wait "$TEE_PID"
           rm -f "$OCR_STDERR_FIFO"
         else
-          ocr review "${ARGS[@]}" > /tmp/ocr-result.json 2>/tmp/ocr-stderr.log
+          "$OCR_EXECUTABLE" review "${ARGS[@]}" > /tmp/ocr-result.json 2>/tmp/ocr-stderr.log
           OCR_EXIT_CODE=$?
         fi
         set -e
@@ -893,6 +1052,20 @@ runs:
       run: |
         echo "ocr review exited with code ${OCR_EXIT_CODE}; see uploaded artifacts for details."
         exit "${OCR_EXIT_CODE}"
+
+    - name: Validate complete review
+      if: inputs.require_complete == 'true' && env.OCR_EXIT_CODE == '0'
+      shell: bash
+      run: |
+        HELPER="$GITHUB_ACTION_PATH/scripts/github-actions/validate-review-result.js"
+        if [ ! -f "$HELPER" ]; then
+          HELPER="$GITHUB_WORKSPACE/scripts/github-actions/validate-review-result.js"
+        fi
+        if [ ! -f "$HELPER" ]; then
+          echo "::error::Could not locate the trusted review-result validator"
+          exit 1
+        fi
+        node "$HELPER" /tmp/ocr-result.json
 
     - name: Post review comments
       if: env.OCR_EXIT_CODE == '0'

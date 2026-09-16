@@ -2,6 +2,135 @@
 
 This directory provides a ready-to-use GitHub Actions workflow demo that integrates OpenCodeReview into your repository to automatically review Pull Requests and post inline review comments. Copy it into `.github/workflows/` and configure the required secrets/vars.
 
+## Claude Code gateway and fork builds
+
+Use [`claude-code.yml`](claude-code.yml) with the reusable workflow
+[`.github/workflows/claude-review.yml`](../../.github/workflows/claude-review.yml)
+when OCR should run through the installed `claude -p` CLI. This path builds a
+pinned public fork revision instead of downloading the upstream OCR npm package.
+It needs no MCP server, Claude GitHub App, or direct Anthropic API key.
+
+### Deploy to a repository or organization
+
+1. Push a fork commit containing the reusable workflow, composite Action, and
+   Claude CLI backend. No release, npm publication, or tag push is needed. The
+   workflow builds with version `v1.12.2+fork.<source_sha>`: the upstream
+   compatibility baseline plus the immutable fork identity, so tagless forks
+   pass the Action's version gates. Maintain that baseline when updating the
+   workflow to a newer upstream version. Do not push release tags just for CI;
+   they can trigger the inherited upstream release/publishing workflow.
+2. Copy `claude-code.yml` to `.github/workflows/ocr-review.yml` in a consumer
+   repository. Replace **both** `REPLACE_WITH_COMMIT_SHA` occurrences with that
+   same full 40-character fork commit SHA. Set `source_repository` and the
+   repository in `uses:` to your public fork; the example uses
+   `p4u/open-code-review`. Do not build the reviewed PR's copy of OCR.
+3. Add the Actions secret `OCR_GATEWAY_AUTH_TOKEN`. At organization level, grant
+   it access only to participating repositories. The caller explicitly passes
+   this secret; it does not use `secrets: inherit`.
+4. Set `gateway_url:` in the caller YAML, or omit it and define an organization
+   or repository Actions variable `OCR_GATEWAY_URL`. It must be an HTTPS URL
+   without embedded credentials, query parameters, or fragment. The example
+   points to the Vocdoni gateway; replace it for another deployment.
+5. Optionally set the organization/repository Actions variable `OCR_MODEL`, or
+   specify `model:` directly in the caller YAML (precedence below).
+6. If your organization restricts Actions, permit the fork's reusable workflow
+   and its pinned GitHub Actions. Merge the caller into the reviewed repository's
+   default branch, then open a small pilot PR before wider rollout.
+
+GitHub-hosted runners do not inherit a developer's shell exports or Claude login.
+The workflow installs Claude Code `2.1.273` by default and supplies the gateway
+URL, authentication token, gateway/model-discovery flags, nonessential-traffic
+setting, and request timeout. `claude_version` accepts another exact release
+version, not `latest` or a range. The gateway remains responsible for its own
+upstream authentication and billing; this workflow does not provision a subscription.
+
+### Choose the model
+
+The reusable workflow resolves the model in this order:
+
+1. Explicit `with.model` in the consumer's CI YAML.
+2. Repository/organization Actions variable `OCR_MODEL` (repository overrides organization).
+3. `claude-gpt-6-astra`.
+
+For example, the following caller fragment overrides the Actions variable:
+
+```yaml
+jobs:
+  review:
+    uses: p4u/open-code-review/.github/workflows/claude-review.yml@REPLACE_WITH_COMMIT_SHA
+    with:
+      source_repository: p4u/open-code-review
+      source_sha: REPLACE_WITH_COMMIT_SHA
+      gateway_url: https://claude.vocdoni.net
+      model: claude-gpt-6-astra
+    secrets:
+      gateway_token: ${{ secrets.OCR_GATEWAY_AUTH_TOKEN }}
+```
+
+Use `model: default` to leave selection to Claude Code, or pass an available
+alias/full model identifier unchanged. Ordinary caller-level `env:` values do
+**not** propagate into a reusable workflow: use Actions **Variables** or the
+`model` input. If calling the composite Action directly as a step instead, an
+ordinary workflow environment variable works with
+`llm_model: ${{ env.OCR_MODEL }}`.
+
+### Trust boundaries and failure policy
+
+The reusable workflow accepts only `pull_request_target` events for internal,
+non-draft, human-authored PRs. Fork PRs, bot PRs (including Dependabot), comment
+commands, and `workflow_dispatch` are not enabled by this initial rollout.
+Adding external PR support requires a separately reviewed, maintainer-authorized
+entry point; do not remove the guards just to obtain secrets.
+
+The runner checks out the **base SHA**, fetches PR objects, and reviews the
+explicit commit range without checking out or executing the PR head. Rules come
+from the trusted base checkout. Only pinned tooling source is built; project
+builds, tests, dependency installation, and PR-provided scripts must not be added
+to this privileged job. The fork source lives in `.ocr-tooling`; the composite
+Action verifies the existing base checkout instead of cleaning away its own code.
+Third-party Actions are SHA-pinned. Go and Node dependency caches are disabled
+in this privileged workflow. The Claude install runs outside the reviewed repo.
+
+The gateway credential is passed as `claude_auth_token` and becomes
+`ANTHROPIC_AUTH_TOKEN` only in the Action's review shell. CLI mode uses an isolated
+OCR home so stale API-key commands or global MCP servers cannot become active;
+Claude's existing config directory is preserved for direct Action users. Never
+save secrets in the caller YAML or enable shell tracing around credentials.
+
+Findings are **advisory**, but execution must be complete: the workflow enables
+`require_complete`, checking the v1 run manifest rather than trusting exit code
+zero. Failed, waived, missing, budget-limited, malformed, or unknown-schema
+results fail before publication. A legitimate empty selection is accepted.
+The result validator caps JSON at 16 MiB; an oversized report fails with a clear
+error instead of allocating unbounded memory. Comment-posting failures or a
+missing summary URL also fail the check. Findings alone do not fail it.
+
+Defaults are `effort: low`, `review_concurrency: '1'`, a 500,000-token total cap,
+and a 30-minute job deadline. Override the first three via workflow inputs.
+Cancellation in the example supersedes old reviews of the **same PR**, not
+reviews across repositories; use gateway-side limits for organization-wide
+concurrency. Start with a non-required check until the pilot is verified.
+Raw result/stderr artifacts contain repository content; apply suitable repository
+access and Actions artifact-retention policies.
+
+### Composite Action inputs for custom workflows
+
+These options are also usable independently of the reusable workflow:
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `provider` | empty | Existing HTTP configuration, or `claude-code` for the CLI backend. |
+| `ocr_binary` | empty | Absolute path to a trusted executable; skips upstream npm installation. Empty retains the npm installer. |
+| `claude_auth_token` | empty | Optional gateway credential scoped to the CLI review process; otherwise existing CLI authentication is inherited. |
+| `skip_checkout` | `'false'` | Reuse a prepared checkout. On PR events its HEAD must match the trusted base SHA. Needed when the local Action lives inside that checkout. |
+| `require_complete` | `'false'` | Require a valid, complete current review manifest before posting. |
+
+`llm_model` is still required. In CLI mode do not supply HTTP URL, API-token,
+header, reasoning-effort, or body configuration. The built-in HTTP body default
+is not applied to CLI requests. Existing HTTP consumers keep their installation
+and configuration paths unchanged. The Action disables the npm launcher's
+auto-updater while invoking it so a pinned version stays pinned.
+
 ## Quick Start: `ocr-review.yml`
 
 The simplest adoption path: this demo delegates every step — checkout, OCR install, review, comment posting, artifact upload — to the official reusable composite action at [`action.yml`](../../action.yml) via a single `uses: alibaba/open-code-review@main` step. It covers both automatic PR review (`pull_request_target: opened/synchronize/reopened`) and on-demand re-review via comments (`/open-code-review` or `@open-code-review`). No inline scripts to maintain — `@main` always runs the latest action; see [Reproducible pinning](#reproducible-pinning) when you need runs to be repeatable.

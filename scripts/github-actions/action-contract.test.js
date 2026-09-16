@@ -127,7 +127,7 @@ function parseSteps(text) {
       }
     }
 
-    steps.push({ name: current.name, run, env, index: current.index });
+    steps.push({ name: current.name, run, env, index: current.index, raw: rawLines.join("\n") });
     current = undefined;
   }
 
@@ -211,7 +211,11 @@ function installStep() {
 function makeFixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-code-review-action-contract-"));
   const bin = path.join(dir, "bin");
+  const home = path.join(dir, "home");
+  const workspace = path.join(dir, "workspace");
   fs.mkdirSync(bin);
+  fs.mkdirSync(home);
+  fs.mkdirSync(workspace);
   const callsPath = path.join(dir, "calls.jsonl");
   const npmCallsPath = path.join(dir, "npm-calls.jsonl");
   const configPath = path.join(dir, "config.jsonl");
@@ -222,14 +226,28 @@ function makeFixture() {
 const fs = require("fs");
 const args = process.argv.slice(2);
 const env = {};
-for (const name of ["OCR_LLM_TIMEOUT", "OCR_LLM_EXTRA_HEADERS", "REVIEW_TASK_TIMEOUT", "OCR_TIMEOUT"]) {
+for (const name of [
+  "HOME", "CLAUDE_CONFIG_DIR", "GIT_CONFIG_GLOBAL", "OCR_NO_UPDATE",
+  "OCR_LLM_TIMEOUT", "OCR_LLM_EXTRA_HEADERS", "REVIEW_TASK_TIMEOUT", "OCR_TIMEOUT",
+  "OCR_LLM_URL", "OCR_LLM_MODEL", "OCR_USE_ANTHROPIC", "OCR_LLM_AUTH_HEADER",
+  "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+]) {
   if (process.env[name] !== undefined) env[name] = process.env[name];
 }
-const record = { args, env };
+const configFile = process.env.HOME + "/.opencodereview/config.json";
+const savedConfig = fs.existsSync(configFile) ? JSON.parse(fs.readFileSync(configFile, "utf8")) : {};
+const record = {
+  args, env, executable: process.argv[1], savedConfig,
+  hasOCRToken: Object.prototype.hasOwnProperty.call(process.env, "OCR_LLM_TOKEN"),
+  hasGatewayInput: Object.prototype.hasOwnProperty.call(process.env, "CLAUDE_AUTH_TOKEN_INPUT"),
+};
 fs.appendFileSync(process.env.OCR_CALLS, JSON.stringify(record) + "\\n");
 if (args[0] === "config" && args[1] === "set") {
   fs.appendFileSync(process.env.OCR_CONFIG, JSON.stringify(args) + "\\n");
   process.stdout.write("ocr config set " + args.slice(2).join(" ") + "\\n");
+  fs.mkdirSync(require("path").dirname(configFile), { recursive: true });
+  savedConfig[args[2]] = args[3];
+  fs.writeFileSync(configFile, JSON.stringify(savedConfig));
 } else if (args[0] === "config" && args[1] === "unset") {
   fs.appendFileSync(process.env.OCR_CONFIG, JSON.stringify(args) + "\\n");
   process.stdout.write("ocr config unset " + args.slice(2).join(" ") + "\\n");
@@ -257,7 +275,7 @@ process.stdout.write("npm " + args.join(" ") + "\\n");
     fs.writeFileSync(file, body, { mode: 0o755 });
   }
 
-  return { dir, bin, callsPath, npmCallsPath, configPath, resultPath, stderrPath };
+  return { dir, bin, home, workspace, callsPath, npmCallsPath, configPath, resultPath, stderrPath };
 }
 
 function removeFixture(fixture) {
@@ -265,13 +283,21 @@ function removeFixture(fixture) {
 }
 
 function runShell(script, env, fixture) {
+  const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) =>
+    !/^(OCR_|ANTHROPIC_|CLAUDE_|GIT_|GITHUB_)/.test(name)
+  ));
   const result = spawnSync("/bin/bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", script], {
-    cwd: ROOT,
-    env: Object.assign({}, process.env, {
+    cwd: fixture.workspace,
+    env: Object.assign({}, inherited, {
       PATH: `${fixture.bin}:${process.env.PATH || ""}`,
+      HOME: fixture.home,
+      RUNNER_TEMP: fixture.dir,
+      OCR_EXECUTABLE: path.join(fixture.bin, "ocr"),
       OCR_CALLS: fixture.callsPath,
       OCR_NPM_CALLS: fixture.npmCallsPath,
       OCR_CONFIG: fixture.configPath,
+      GITHUB_WORKSPACE: fixture.workspace,
+      GITHUB_ACTION_PATH: ROOT,
       GITHUB_OUTPUT: path.join(fixture.dir, "github-output"),
       GITHUB_ENV: path.join(fixture.dir, "github-env"),
     }, env),
@@ -795,7 +821,7 @@ function testRunKeepsAgentAudienceAndLogFileByDefault() {
   assert.ok(run, "action.yml must retain the Run OpenCodeReview step");
   assert.match(
     run.run,
-    /STREAM_PROGRESS:-false\}" = "true" \]; then\s+OCR_STDERR_FIFO="\$\(mktemp -u\)"\s+mkfifo "\$OCR_STDERR_FIFO" \|\| exit 1\s+tee \/tmp\/ocr-stderr\.log < "\$OCR_STDERR_FIFO" >&2 &\s+TEE_PID=\$!\s+ocr review "\$\{ARGS\[@\]\}" > \/tmp\/ocr-result\.json 2> "\$OCR_STDERR_FIFO"\s+OCR_EXIT_CODE=\$\?\s+wait "\$TEE_PID"\s+rm -f "\$OCR_STDERR_FIFO"\s+else\s+ocr review "\$\{ARGS\[@\]\}" > \/tmp\/ocr-result\.json 2>\/tmp\/ocr-stderr\.log/,
+    /STREAM_PROGRESS:-false\}" = "true" \]; then\s+OCR_STDERR_FIFO="\$\(mktemp -u\)"\s+mkfifo "\$OCR_STDERR_FIFO" \|\| exit 1\s+tee \/tmp\/ocr-stderr\.log < "\$OCR_STDERR_FIFO" >&2 &\s+TEE_PID=\$!\s+"\$OCR_EXECUTABLE" review "\$\{ARGS\[@\]\}" > \/tmp\/ocr-result\.json 2> "\$OCR_STDERR_FIFO"\s+OCR_EXIT_CODE=\$\?\s+wait "\$TEE_PID"\s+rm -f "\$OCR_STDERR_FIFO"\s+else\s+"\$OCR_EXECUTABLE" review "\$\{ARGS\[@\]\}" > \/tmp\/ocr-result\.json 2>\/tmp\/ocr-stderr\.log/,
     "the live-tee path must be gated on stream_progress, flush the FIFO-fed tee via wait, and the default path must redirect stderr to the log file"
   );
   const fixture = makeFixture();
@@ -1587,7 +1613,391 @@ function testExampleReadmeDocumentsTimeoutAndVersionContracts() {
   );
 }
 
+function testTransportInputsAndValidation() {
+  for (const name of ["provider", "ocr_binary", "claude_auth_token", "skip_checkout", "require_complete"]) {
+    assert.ok(INPUTS[name], `action must define ${name}`);
+  }
+  assert.strictEqual(INPUTS.provider.default, "");
+  assert.strictEqual(INPUTS.skip_checkout.default, "false");
+  assert.strictEqual(INPUTS.require_complete.default, "false");
+  for (const name of ["llm_url", "llm_auth_token", "llm_use_anthropic"]) {
+    const block = ACTION_TEXT.match(new RegExp(`^  ${name}:\\s*$([\\s\\S]*?)(?=^  [A-Za-z0-9_]+:|^outputs:)`, "m"));
+    assert.match(block[1], /required: false/);
+  }
+  assert.match(ACTION_TEXT, /  llm_model:\s*\n[^\n]*\n    required: true/);
+  const step = stepNamed("Validate transport and checkout");
+  assert.ok(step.index < stepNamed("Checkout base").index, "validate transport before checkout or installing tools");
+  const cases = [
+    [{}, true],
+    [{ provider: "claude-code" }, true],
+    [{ provider: "openai" }, false],
+    [{ provider: "CLAUDE-CODE" }, false],
+    [{ provider: "claude-code\nOCR_EXECUTABLE=/evil" }, false],
+    [{ skip_checkout: "true", require_complete: "true" }, true],
+    [{ skip_checkout: "TRUE" }, false],
+    [{ skip_checkout: "" }, false],
+    [{ require_complete: "yes" }, false],
+  ];
+  for (const [overrides, valid] of cases) {
+    const fixture = makeFixture();
+    try {
+      const result = runStep(step, inputValues(overrides), fixture);
+      assert.strictEqual(result.status === 0, valid, resultDescription(result));
+      if (!valid) assert.match(result.stdout, /::error::(?:provider|skip_checkout|require_complete) must be/);
+      assert.deepStrictEqual(readJsonLines(fixture.npmCallsPath), []);
+      assert.deepStrictEqual(readJsonLines(fixture.callsPath), []);
+    } finally {
+      removeFixture(fixture);
+    }
+  }
+}
+
+function testPreinstalledBinaryValidationAndVersionGates() {
+  const cases = [
+    { kind: "space", version: "open-code-review 1.10.0+fork.abc123 linux/amd64", valid: true },
+    { kind: "symlink", valid: true },
+    { kind: "relative", valid: false },
+    { kind: "missing", valid: false },
+    { kind: "directory", valid: false },
+    { kind: "not-executable", valid: false },
+    { kind: "newline", valid: false },
+    { kind: "carriage-return", valid: false },
+    { kind: "command", valid: false },
+    { kind: "space", version: "open-code-review 1.9.5 linux/amd64", valid: false },
+    { kind: "space", version: "open-code-review 1.10.0-rc.1 linux/amd64", valid: false },
+    { kind: "space", version: "open-code-review 1.9.9 linux/amd64", effort: "low", valid: false },
+    { kind: "space", version: "open-code-review 1.9.7 linux/amd64", stream: "true", valid: false },
+  ];
+  for (const testCase of cases) {
+    const fixture = makeFixture();
+    try {
+      const trustedDir = path.join(fixture.dir, "trusted tooling");
+      fs.mkdirSync(trustedDir);
+      const executable = path.join(trustedDir, "ocr fork");
+      fs.copyFileSync(path.join(fixture.bin, "ocr"), executable);
+      fs.chmodSync(executable, 0o755);
+      let selected = executable;
+      if (testCase.kind === "relative") selected = "./ocr";
+      if (testCase.kind === "missing") selected += " missing";
+      if (testCase.kind === "directory") selected = trustedDir;
+      if (testCase.kind === "not-executable") fs.chmodSync(executable, 0o644);
+      if (testCase.kind === "command") selected += " --version";
+      if (["newline", "carriage-return"].includes(testCase.kind)) {
+        selected += testCase.kind === "newline" ? "\nINJECTED=yes" : "\rINJECTED=yes";
+        fs.copyFileSync(executable, selected);
+        fs.chmodSync(selected, 0o755);
+      }
+      if (testCase.kind === "symlink") {
+        selected = path.join(trustedDir, "ocr link");
+        fs.symlinkSync(executable, selected);
+      }
+      const result = runStep(installStep(), inputValues({ ocr_binary: selected }), fixture, {
+        OCR_FAKE_VERSION_OUTPUT: testCase.version || "open-code-review 1.10.0 (abc1234) linux/amd64",
+        EFFORT: testCase.effort || "",
+        STREAM_PROGRESS: testCase.stream || "false",
+      });
+      assert.strictEqual(result.status === 0, testCase.valid, `${testCase.kind}: ${resultDescription(result)}`);
+      assert.deepStrictEqual(readJsonLines(fixture.npmCallsPath), [], "preinstalled binary must never fall back to npm");
+      const exported = readEnvAssignments(path.join(fixture.dir, "github-env"));
+      assert.strictEqual(exported.INJECTED, undefined, "path must not inject job environment values");
+      if (testCase.valid) {
+        assert.strictEqual(exported.OCR_EXECUTABLE, selected);
+        const call = readJsonLines(fixture.callsPath)[0];
+        assert.deepStrictEqual(call.args, ["version"]);
+        assert.strictEqual(call.env.OCR_NO_UPDATE, "1");
+        assert.ok(exported.OCR_VERSION_ACTUAL.includes("abc123"), "fork commit identity must survive in fingerprint version");
+      }
+    } finally {
+      removeFixture(fixture);
+    }
+  }
+}
+
+function testCLIIsolationModelForwardingAndCredentialScope() {
+  for (const auth of ["gateway", "inherited", "api-key", "saved"]) {
+    const fixture = makeFixture();
+    try {
+      const executable = path.join(fixture.dir, "trusted ocr binary");
+      fs.copyFileSync(path.join(fixture.bin, "ocr"), executable);
+      fs.chmodSync(executable, 0o755);
+      const configDir = path.join(fixture.home, ".opencodereview");
+      fs.mkdirSync(configDir);
+      const staleConfig = JSON.stringify({
+        provider: "unrelated",
+        providers: { "claude-code": { api_key_cmd: "touch must-not-run", extra_body: { thinking: { type: "disabled" } } } },
+        llm: { auth_token_cmd: "touch must-not-run" },
+        mcp_servers: { dangerous: { command: "touch", args: ["must-not-run"] } },
+      });
+      const globalConfigPath = path.join(configDir, "config.json");
+      fs.writeFileSync(globalConfigPath, staleConfig);
+      const claudeDir = path.join(fixture.home, ".claude");
+      fs.mkdirSync(claudeDir);
+      fs.writeFileSync(path.join(claudeDir, ".credentials.json"), '{"fake":"saved-auth"}');
+      const values = inputValues({
+        provider: "claude-code",
+        ocr_binary: executable,
+        llm_model: 'gateway alias[1m]; $(touch must-not-run)',
+        claude_auth_token: auth === "gateway" ? "gateway-secret-sentinel" : "",
+        // Deliberately unusable HTTP settings must be ignored, not interpreted.
+        llm_url: "https://ignored.invalid",
+        llm_auth_token: "ignored-http-token",
+        llm_auth_header: "ignored-header",
+        llm_extra_headers: "not even a header",
+        llm_extra_body: "not even JSON",
+        llm_reasoning_effort: "not an HTTP effort",
+      });
+      if (auth === "saved") {
+        Object.assign(values, {
+          llm_url: "", llm_auth_token: "", llm_auth_header: "", llm_extra_headers: "",
+          llm_extra_body: INPUTS.llm_extra_body.default, llm_reasoning_effort: "",
+        });
+      }
+      const installed = runStep(installStep(), values, fixture);
+      assert.strictEqual(installed.status, 0, resultDescription(installed));
+      const selected = readEnvAssignments(path.join(fixture.dir, "github-env"));
+      const validated = runStep(validationStep(), values, fixture);
+      assert.strictEqual(validated.status, 0, resultDescription(validated));
+      const validatedEnv = readEnvAssignments(path.join(fixture.dir, "github-env"));
+      assert.strictEqual(validatedEnv.LLM_REASONING_EFFORT, "");
+      const configured = runStep(stepNamed("Configure OCR"), values, fixture, selected);
+      assert.strictEqual(configured.status, 0, resultDescription(configured));
+      assert.deepStrictEqual(configOperations(fixture), [["config", "set", "language", "English"]]);
+      assert.doesNotMatch(configured.stdout + configured.stderr, /gateway-secret-sentinel|ignored-http-token/);
+      const home = readEnvAssignments(path.join(fixture.dir, "github-output")).home;
+      assert.ok(home && home !== fixture.home, "CLI OCR config must use a fresh isolated home");
+      const extraEnv = {
+        ...validatedEnv,
+        OCR_ACTION_HOME: home,
+        MERGE_BASE: "base-sha",
+        HEAD_SHA: "head-sha",
+      };
+      if (auth === "gateway") extraEnv.ANTHROPIC_AUTH_TOKEN = "overridden-inherited-token";
+      if (auth === "inherited") {
+        extraEnv.ANTHROPIC_AUTH_TOKEN = "inherited-secret-sentinel";
+        extraEnv.CLAUDE_CONFIG_DIR = claudeDir;
+      }
+      if (auth === "api-key") extraEnv.ANTHROPIC_API_KEY = "inherited-api-key-sentinel";
+      const reviewed = runStep(stepNamed("Run OpenCodeReview"), values, fixture, extraEnv, { replaceResultPaths: true });
+      assert.strictEqual(reviewed.status, 0, resultDescription(reviewed));
+      const calls = readJsonLines(fixture.callsPath);
+      assert.ok(calls.every((call) => call.executable === executable), "version/config/review must use exactly the selected executable");
+      assert.ok(calls.every((call) => call.env.OCR_NO_UPDATE === "1"));
+      for (const call of calls.filter((call) => call.args[0] !== "review")) {
+        assert.strictEqual(call.env.ANTHROPIC_AUTH_TOKEN, undefined, "gateway token must not reach install/configure");
+      }
+      const review = calls.find((call) => call.args[0] === "review");
+      assert.ok(review);
+      assert.strictEqual(review.args[review.args.indexOf("--provider") + 1], "claude-code");
+      assert.strictEqual(review.args[review.args.indexOf("--model") + 1], values.llm_model);
+      assert.strictEqual(review.env.HOME, home);
+      assert.strictEqual(review.env.CLAUDE_CONFIG_DIR, claudeDir);
+      assert.strictEqual(review.env.GIT_CONFIG_GLOBAL, path.join(fixture.home, ".gitconfig"));
+      assert.deepStrictEqual(review.savedConfig, { language: "English" }, "no saved OCR HTTP fields, command credentials or MCP can be loaded");
+      for (const name of ["OCR_LLM_URL", "OCR_LLM_EXTRA_HEADERS", "OCR_LLM_AUTH_HEADER", "OCR_USE_ANTHROPIC"]) {
+        assert.strictEqual(review.env[name], undefined, `${name} must not reach CLI review`);
+      }
+      assert.strictEqual(review.hasOCRToken, false);
+      assert.strictEqual(review.hasGatewayInput, false);
+      assert.strictEqual(review.env.ANTHROPIC_AUTH_TOKEN,
+        auth === "gateway" ? values.claude_auth_token : auth === "inherited" ? extraEnv.ANTHROPIC_AUTH_TOKEN : undefined);
+      if (auth === "api-key") assert.strictEqual(review.env.ANTHROPIC_API_KEY, extraEnv.ANTHROPIC_API_KEY);
+      assert.strictEqual(fs.readFileSync(globalConfigPath, "utf8"), staleConfig, "global OCR settings must not be overwritten");
+      assert.strictEqual(fs.readFileSync(path.join(claudeDir, ".credentials.json"), "utf8"), '{"fake":"saved-auth"}');
+      assert.deepStrictEqual(readJsonLines(fixture.npmCallsPath), []);
+      assert.ok(!fs.existsSync(path.join(fixture.workspace, "must-not-run")), "model must remain a quoted argument");
+      assert.doesNotMatch(fs.readFileSync(path.join(fixture.dir, "github-env"), "utf8"), /secret-sentinel|ignored-http-token/);
+    } finally {
+      removeFixture(fixture);
+    }
+  }
+  for (const step of STEPS) {
+    if (step.name === "Run OpenCodeReview") continue;
+    assert.doesNotMatch(JSON.stringify(step.env), /inputs\.claude_auth_token/, "only review may bind the gateway input");
+    assert.doesNotMatch(step.run || "", /ANTHROPIC_AUTH_TOKEN/, "only review may map the gateway credential");
+  }
+}
+
+function testHTTPAndCLIConditionalSettings() {
+  const fixture = makeFixture();
+  try {
+    const values = inputValues({ llm_url: "https://http.invalid", llm_model: "http-model", llm_auth_token: "http-token", claude_auth_token: "unused-gateway-token" });
+    for (const step of [installStep(), stepNamed("Configure OCR"), stepNamed("Run OpenCodeReview")]) {
+      const result = runStep(step, values, fixture, { REVIEW_TASK_TIMEOUT: "15", MERGE_BASE: "base", HEAD_SHA: "head" }, { replaceResultPaths: true });
+      assert.strictEqual(result.status, 0, resultDescription(result));
+    }
+    const calls = readJsonLines(fixture.callsPath);
+    assert.ok(calls.every((call) => call.env.OCR_NO_UPDATE === "1"), "all npm-launcher invocations must disable updates");
+    const review = calls.find((call) => call.args[0] === "review");
+    assert.ok(!review.args.includes("--provider"));
+    assert.strictEqual(review.env.ANTHROPIC_AUTH_TOKEN, undefined, "HTTP must not map the CLI gateway token");
+    assert.strictEqual(review.env.OCR_LLM_MODEL, "http-model");
+    assert.strictEqual(review.env.HOME, fixture.home, "legacy HTTP home remains unchanged");
+    assert.strictEqual(readJsonLines(fixture.npmCallsPath).length, 1);
+    const missingURL = runStep(stepNamed("Configure OCR"), { ...values, llm_url: "" }, fixture);
+    assert.notStrictEqual(missingURL.status, 0);
+    assert.match(missingURL.stdout, /llm_url is required/);
+    const missingToken = runStep(stepNamed("Run OpenCodeReview"), { ...values, llm_auth_token: "" }, fixture,
+      { REVIEW_TASK_TIMEOUT: "15", MERGE_BASE: "base", HEAD_SHA: "head" }, { replaceResultPaths: true });
+    assert.notStrictEqual(missingToken.status, 0);
+    assert.match(missingToken.stdout, /llm_auth_token is required/);
+    const missingModel = runStep(stepNamed("Configure OCR"), { ...values, provider: "claude-code", llm_model: "" }, fixture);
+    assert.notStrictEqual(missingModel.status, 0);
+    assert.match(missingModel.stdout, /llm_model is required/);
+    const missingHome = runStep(stepNamed("Run OpenCodeReview"), { ...values, provider: "claude-code" }, fixture,
+      { REVIEW_TASK_TIMEOUT: "15", MERGE_BASE: "base", HEAD_SHA: "head" }, { replaceResultPaths: true });
+    assert.notStrictEqual(missingHome.status, 0);
+    assert.match(missingHome.stdout, /Isolated claude-code configuration is missing/);
+  } finally {
+    removeFixture(fixture);
+  }
+}
+
+function testTrustedCheckoutAndRefs() {
+  const checkout = stepNamed("Checkout base");
+  assert.match(checkout.raw, /if: inputs\.skip_checkout != 'true'/);
+  assert.match(checkout.raw, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+  assert.doesNotMatch(checkout.raw, /clean: false|head\.sha|pull_request\.head/);
+  assert.ok(stepNamed("Verify trusted checkout").index < stepNamed("Fetch PR head (fork-safe)").index);
+  const fixture = makeFixture();
+  try {
+    function git(...args) {
+      const result = spawnSync("git", args, {
+        cwd: fixture.workspace,
+        env: { PATH: process.env.PATH, HOME: fixture.home, GIT_CONFIG_NOSYSTEM: "1", LC_ALL: "C" },
+        encoding: "utf8",
+      });
+      assert.strictEqual(result.status, 0, resultDescription(result));
+      return result.stdout.trim();
+    }
+    git("init", "--initial-branch=main");
+    git("config", "user.name", "Contract Test");
+    git("config", "user.email", "contract@example.invalid");
+    git("commit", "--allow-empty", "-m", "trusted base");
+    const base = git("rev-parse", "HEAD");
+    git("checkout", "-b", "pull-head");
+    fs.writeFileSync(path.join(fixture.workspace, "untrusted-head-file"), "must not materialize");
+    git("add", "untrusted-head-file");
+    git("commit", "-m", "untrusted PR head");
+    const head = git("rev-parse", "HEAD");
+    const mismatch = runShell(stepNamed("Verify trusted checkout").run, { EVENT_BASE_SHA: base }, fixture);
+    assert.notStrictEqual(mismatch.status, 0, "skip_checkout must reject a PR-head checkout");
+    assert.match(mismatch.stdout, /trusted pull request base.sha/);
+    const origin = path.join(fixture.dir, "origin.git");
+    git("clone", "--bare", fixture.workspace, origin);
+    git("--git-dir", origin, "update-ref", "refs/pull/123/head", head);
+    git("checkout", "--detach", base);
+    git("remote", "add", "origin", origin);
+    const trusted = runShell(stepNamed("Verify trusted checkout").run, { EVENT_BASE_SHA: base }, fixture);
+    assert.strictEqual(trusted.status, 0, resultDescription(trusted));
+    const comment = runShell(stepNamed("Verify trusted checkout").run, { EVENT_BASE_SHA: "" }, fixture);
+    assert.strictEqual(comment.status, 0, "issue_comment keeps trusted default-base behavior");
+    const refs = runShell(stepNamed("Resolve PR refs").run, {
+      INPUT_BASE_REF: "", INPUT_HEAD_SHA: "", EVENT_BASE_REF: "main", EVENT_HEAD_SHA: head,
+    }, fixture);
+    assert.strictEqual(refs.status, 0, resultDescription(refs));
+    const fetched = runShell(stepNamed("Fetch PR head (fork-safe)").run, { PR_NUM: "123" }, fixture);
+    assert.strictEqual(fetched.status, 0, resultDescription(fetched));
+    const merged = runShell(stepNamed("Compute merge-base").run, { BASE_REF: "main", HEAD_SHA: head }, fixture);
+    assert.strictEqual(merged.status, 0, resultDescription(merged));
+    assert.strictEqual(readEnvAssignments(path.join(fixture.dir, "github-env")).MERGE_BASE, base);
+    assert.strictEqual(git("rev-parse", "HEAD"), base, "fetch/merge-base must leave HEAD at trusted base");
+    assert.ok(!fs.existsSync(path.join(fixture.workspace, "untrusted-head-file")));
+    for (const [baseRef, headSha] of [["main\nINJECTED=x", head], ["--upload-pack=evil", head], ["main", "$(touch injected)"], ["main", ""]]) {
+      const result = runShell(stepNamed("Resolve PR refs").run, {
+        INPUT_BASE_REF: baseRef, INPUT_HEAD_SHA: headSha, EVENT_BASE_REF: "", EVENT_HEAD_SHA: "",
+      }, fixture);
+      assert.notStrictEqual(result.status, 0, "untrusted refs must fail before entering GITHUB_ENV/git commands");
+    }
+  } finally {
+    removeFixture(fixture);
+  }
+}
+
+function testMergeBaseFailsClosed() {
+  for (const failure of ["fetch", "merge-base", "empty-result"]) {
+    const fixture = makeFixture();
+    try {
+      fs.writeFileSync(path.join(fixture.bin, "git"), `#!/bin/bash
+if [[ "$1" = "fetch" ]]; then
+  [[ "${failure}" != "fetch" ]]
+elif [[ "${failure}" = "empty-result" ]]; then
+  exit 0
+else
+  exit 1
+fi
+`, { mode: 0o755 });
+      const result = runShell(stepNamed("Compute merge-base").run, { BASE_REF: "main", HEAD_SHA: "a".repeat(40) }, fixture);
+      assert.notStrictEqual(result.status, 0, `must not fall back to head on ${failure}`);
+      assert.strictEqual(readEnvAssignments(path.join(fixture.dir, "github-env")).MERGE_BASE, undefined);
+    } finally {
+      removeFixture(fixture);
+    }
+  }
+}
+
+async function testCheckpointFingerprintSeparatesTransports() {
+  const range = stepNamed("Resolve review range");
+  assert.strictEqual(range.env.OCR_FP_PROVIDER, "${{ inputs.provider }}");
+  const source = range.raw.split("        script: |\n")[1].split("\n").map((line) => line.slice(10)).join("\n");
+  const execute = new (Object.getPrototypeOf(async function () {}).constructor)("require", "process", "core", "context", "github", source);
+  const fixture = makeFixture();
+  try {
+    async function fingerprint(provider) {
+      const outputs = {};
+      await execute(require, { env: {
+        GITHUB_ACTION_PATH: ROOT, GITHUB_WORKSPACE: fixture.workspace,
+        OCR_VERSION_ACTUAL: "open-code-review 1.10.0 (abc1234)",
+        OCR_FP_PROVIDER: provider, OCR_FP_LLM_MODEL: "same-model",
+        OCR_HEAD_SHA: "a".repeat(40), OCR_BASE_REF: "main", OCR_MERGE_BASE: "b".repeat(40), OCR_STICKY_SUMMARY: "true",
+      } }, {
+        setOutput: (name, value) => { outputs[name] = value; }, info() {},
+        warning(message) { throw new Error(message); },
+      }, { repo: { owner: "owner", repo: "repo" }, issue: { number: 1 } }, {
+        rest: { issues: { listComments: async () => ({ data: [] }) } },
+      });
+      assert.match(outputs.config_fingerprint, /^[0-9a-f]{16}$/);
+      return outputs.config_fingerprint;
+    }
+    const http = await fingerprint("");
+    const cli = await fingerprint("claude-code");
+    assert.notStrictEqual(cli, http, "transport changes must invalidate checkpoint reuse even for identical model/version");
+    assert.strictEqual(await fingerprint("claude-code"), cli, "fingerprint must be deterministic");
+  } finally {
+    removeFixture(fixture);
+  }
+}
+
+function testCompletenessGatePrecedesPublication() {
+  const gate = stepNamed("Validate complete review");
+  assert.ok(gate.index > stepNamed("Upload review artifacts").index);
+  assert.ok(gate.index > stepNamed("Fail job on OCR error").index);
+  assert.ok(gate.index < stepNamed("Post review comments").index);
+  assert.match(gate.raw, /if: inputs\.require_complete == 'true' && env\.OCR_EXIT_CODE == '0'/);
+  assert.match(gate.run, /node "\$HELPER" \/tmp\/ocr-result\.json/);
+  for (const exitCode of [0, 1]) {
+    const fixture = makeFixture();
+    try {
+      const helperDir = path.join(fixture.dir, "trusted tooling", "scripts", "github-actions");
+      fs.mkdirSync(helperDir, { recursive: true });
+      fs.writeFileSync(path.join(helperDir, "validate-review-result.js"), `process.exit(${exitCode});`);
+      const result = runStep(gate, inputValues(), fixture,
+        { GITHUB_ACTION_PATH: path.join(fixture.dir, "trusted tooling") }, { replaceResultPaths: true });
+      assert.strictEqual(result.status, exitCode, "validator failure must prevent posting");
+    } finally {
+      removeFixture(fixture);
+    }
+  }
+}
+
 const TESTS = [
+  ["transport inputs validate before tools or checkout", testTransportInputsAndValidation],
+  ["trusted preinstalled OCR bypasses npm and preserves version gates", testPreinstalledBinaryValidationAndVersionGates],
+  ["CLI isolates settings, skips HTTP, forwards models and scopes authentication", testCLIIsolationModelForwardingAndCredentialScope],
+  ["HTTP remains legacy and provider-specific settings are conditional", testHTTPAndCLIConditionalSettings],
+  ["checkout and PR refs preserve the trusted base boundary", testTrustedCheckoutAndRefs],
+  ["merge-base and fetch failures never become empty head reviews", testMergeBaseFailsClosed],
+  ["checkpoint fingerprints distinguish HTTP from CLI transport", testCheckpointFingerprintSeparatesTransports],
+  ["opt-in complete-review validation gates comment publication", testCompletenessGatePrecedesPublication],
   ["review_task_timeout names and describes the CLI task deadline", testReviewTaskTimeoutInputNameAndScope],
   ["llm_timeout defaults to the CLI's 5-minute timeout", testLlmTimeoutInputDefault],
   ["review_task_timeout accepts 1/10/120", testReviewTimeoutValidationAcceptsBoundaries],
@@ -1630,11 +2040,11 @@ const TESTS = [
   ["GitHub Actions README documents timeout and version contracts", testExampleReadmeDocumentsTimeoutAndVersionContracts],
 ];
 
-function main() {
+async function main() {
   const failures = [];
   for (const [name, test] of TESTS) {
     try {
-      test();
+      await test();
       console.log(`ok - ${name}`);
     } catch (error) {
       failures.push({ name, error });
