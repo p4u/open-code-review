@@ -36,14 +36,16 @@ ocr config set providers.anthropic.api_key sk-ant-xxxxxxxxxx
 
 ### 組み込み provider
 
-以下の provider が OCR に同梱されており、Base URL とプロトコルがプリセット
-されています——選択後は API key を入力するだけです。`providers.<name>.api_key`
-が未設定の場合は、対応する環境変数に自動的にフォールバックします。
+以下の provider が OCR に同梱されています。API provider には Base URL と
+プロトコルが設定済みで、`providers.<name>.api_key` が未設定の場合は対応する
+環境変数を使用します。Bedrock は AWS 認証情報チェーンを、Claude Code は
+ローカル CLI が管理する認証を使用するため、OCR に API key を設定する必要はありません。
 
 | 名称 | プロトコル | Base URL | API key 環境変数 |
 |---|---|---|---|
 | `anthropic` | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
 | `bedrock` | anthropic-bedrock | `aws_region` から決定 | —（AWS 認証情報チェーン） |
+| `claude-code` | claude-code | ローカルの `claude -p` サブプロセス | —（Claude Code CLI が認証を管理） |
 | `openai` | openai | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
 | `openai-responses` | openai-responses | `https://api.openai.com/v1` | `OPENAI_RESPONSES_API_KEY` |
 | `gemini` | openai | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` |

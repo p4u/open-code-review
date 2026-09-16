@@ -330,8 +330,9 @@ type ProviderEntry struct {
 	// unmarshalled into this struct and marshalled back on every write, so a
 	// field missing from it is silently dropped from a hand-written config the
 	// first time any config command runs.
-	AWSProfile string `json:"aws_profile,omitempty"`
-	AWSRegion  string `json:"aws_region,omitempty"`
+	AWSProfile    string `json:"aws_profile,omitempty"`
+	AWSRegion     string `json:"aws_region,omitempty"`
+	ClaudeCommand string `json:"claude_command,omitempty"` // executable name or path, not a shell command
 }
 
 // MCPServerConfig holds configuration for a single MCP server.
@@ -362,17 +363,18 @@ type Config struct {
 }
 
 type LlmConfig struct {
-	URL          string            `json:"url,omitempty"`
-	AuthToken    string            `json:"auth_token,omitempty"`
-	AuthTokenCmd string            `json:"auth_token_cmd,omitempty"` // shell command whose stdout is the auth token; used when auth_token is empty
-	AuthHeader   string            `json:"auth_header,omitempty"`
-	Model        string            `json:"model,omitempty"`
-	Protocol     string            `json:"protocol,omitempty"`      // canonical protocol name; takes priority over UseAnthropic
-	UseAnthropic *bool             `json:"use_anthropic,omitempty"` // nil = default true; false = OpenAI protocol (legacy fallback)
-	TimeoutSec   int               `json:"timeout_sec,omitempty"`   // per-request HTTP timeout in seconds
-	ExtraBody    map[string]any    `json:"extra_body,omitempty"`
-	ExtraHeaders map[string]string `json:"extra_headers,omitempty"`
-	RetryCodes   []int             `json:"retry_codes,omitempty"`
+	URL           string            `json:"url,omitempty"`
+	AuthToken     string            `json:"auth_token,omitempty"`
+	AuthTokenCmd  string            `json:"auth_token_cmd,omitempty"` // shell command whose stdout is the auth token; used when auth_token is empty
+	AuthHeader    string            `json:"auth_header,omitempty"`
+	Model         string            `json:"model,omitempty"`
+	Protocol      string            `json:"protocol,omitempty"`      // canonical protocol name; takes priority over UseAnthropic
+	UseAnthropic  *bool             `json:"use_anthropic,omitempty"` // nil = default true; false = OpenAI protocol (legacy fallback)
+	TimeoutSec    int               `json:"timeout_sec,omitempty"`   // per-request HTTP timeout in seconds
+	ExtraBody     map[string]any    `json:"extra_body,omitempty"`
+	ExtraHeaders  map[string]string `json:"extra_headers,omitempty"`
+	RetryCodes    []int             `json:"retry_codes,omitempty"`
+	ClaudeCommand string            `json:"claude_command,omitempty"` // executable name or path, not a shell command
 }
 
 // TelemetryConfig holds telemetry-specific settings.
@@ -436,6 +438,7 @@ var supportedConfigKeys = []string{
 	"llm.extra_body",
 	"llm.extra_headers",
 	"llm.retry_codes",
+	"llm.claude_command",
 	"language",
 	"telemetry.enabled",
 	"telemetry.exporter",
@@ -444,6 +447,27 @@ var supportedConfigKeys = []string{
 }
 
 func setConfigValue(cfg *Config, key, value string) error {
+	if !strings.HasPrefix(key, "llm.") {
+		return applyConfigValue(cfg, key, value)
+	}
+	// Validate a candidate so a rejected protocol/field change leaves the
+	// previous configuration intact, including when called by the TUI.
+	next := *cfg
+	if err := applyConfigValue(&next, key, value); err != nil {
+		return err
+	}
+	if err := validateClaudeCodeSettings(llm.NormalizeProtocol(next.Llm.Protocol), llm.ClientConfig{
+		URL: next.Llm.URL, APIKey: next.Llm.AuthToken, AuthHeader: next.Llm.AuthHeader,
+		ClaudeCommand: next.Llm.ClaudeCommand,
+		ExtraBody:     next.Llm.ExtraBody, ExtraHeaders: next.Llm.ExtraHeaders, RetryCodes: next.Llm.RetryCodes,
+	}, next.Llm.AuthTokenCmd); err != nil {
+		return err
+	}
+	cfg.Llm = next.Llm
+	return nil
+}
+
+func applyConfigValue(cfg *Config, key, value string) error {
 	// Handle providers.<name>.<field> paths.
 	if strings.HasPrefix(key, "providers.") {
 		return setProviderValue(cfg, key, value)
@@ -510,6 +534,8 @@ func setConfigValue(cfg *Config, key, value string) error {
 		cfg.Effort = string(e)
 	case "llm.url", "llm.URL":
 		cfg.Llm.URL = value
+	case "llm.claude_command", "llm.ClaudeCommand":
+		cfg.Llm.ClaudeCommand = value
 	case "llm.auth_token", "llm.AuthToken":
 		cfg.Llm.AuthToken = value
 	case "llm.auth_token_cmd", "llm.AuthTokenCmd":
@@ -549,10 +575,14 @@ func setConfigValue(cfg *Config, key, value string) error {
 		// Mirror use_anthropic so older binaries that predate llm.protocol
 		// still pick the right protocol family: anthropic -> true, the OpenAI
 		// family (including openai-responses) -> false.
-		if normalized == llm.ProtocolAnthropic {
+		switch normalized {
+		case llm.ProtocolAnthropic:
 			t := true
 			cfg.Llm.UseAnthropic = &t
-		} else {
+		case llm.ProtocolClaudeCode:
+			// No legacy HTTP protocol can represent the subprocess backend.
+			cfg.Llm.UseAnthropic = nil
+		default:
 			f := false
 			cfg.Llm.UseAnthropic = &f
 		}
@@ -609,17 +639,61 @@ func setConfigValue(cfg *Config, key, value string) error {
 		}
 		cfg.Llm.RetryCodes = codes
 	default:
-		return fmt.Errorf("unknown config key: %s\nSupported keys: %s\nProvider fields: api_key, api_key_cmd, url, protocol, model, models, auth_header, timeout_sec, extra_body, extra_headers, retry_codes, aws_region, aws_profile\nProtocol values: anthropic, anthropic-bedrock, openai, openai-responses\nMCP server fields: type, command, args, env, url, headers, tools, setup", key, strings.Join(supportedConfigKeys, ", "))
+		return fmt.Errorf("unknown config key: %s\nSupported keys: %s\nProvider fields: api_key, api_key_cmd, url, protocol, model, models, auth_header, timeout_sec, extra_body, extra_headers, retry_codes, aws_region, aws_profile, claude_command\nProtocol values: anthropic, anthropic-bedrock, claude-code, openai, openai-responses\nMCP server fields: type, command, args, env, url, headers, tools, setup", key, strings.Join(supportedConfigKeys, ", "))
 	}
 	return nil
 }
 
 func applyProviderField(providerName string, entry *ProviderEntry, field, key, value string) error {
+	next := *entry
+	if err := setProviderField(providerName, &next, field, key, value); err != nil {
+		return err
+	}
+	if err := validateProviderEntry(providerName, next); err != nil {
+		return err
+	}
+	*entry = next
+	return nil
+}
+
+func validateProviderEntry(providerName string, entry ProviderEntry) error {
+	return validateClaudeCodeSettings(providerProtocol(providerName, entry), llm.ClientConfig{
+		URL: entry.URL, APIKey: entry.APIKey, AuthHeader: entry.AuthHeader,
+		ClaudeCommand: entry.ClaudeCommand, ExtraBody: entry.ExtraBody,
+		ExtraHeaders: entry.ExtraHeaders, RetryCodes: entry.RetryCodes,
+		AWSProfile: entry.AWSProfile, AWSRegion: entry.AWSRegion,
+	}, entry.APIKeyCmd)
+}
+
+func validateClaudeCodeSettings(protocol string, cfg llm.ClientConfig, keyCmd string) error {
+	if protocol != llm.ProtocolClaudeCode {
+		if cfg.ClaudeCommand != "" {
+			return fmt.Errorf("claude_command requires protocol %q", llm.ProtocolClaudeCode)
+		}
+		return nil
+	}
+	if keyCmd != "" {
+		return fmt.Errorf("claude-code does not support api_key_cmd/auth_token_cmd; authentication is managed by the Claude CLI")
+	}
+	return llm.ValidateClaudeCodeConfig(cfg)
+}
+
+func providerProtocol(providerName string, entry ProviderEntry) string {
+	if entry.Protocol != "" {
+		return llm.NormalizeProtocol(entry.Protocol)
+	}
+	preset, _ := llm.LookupProvider(providerName)
+	return preset.Protocol
+}
+
+func setProviderField(providerName string, entry *ProviderEntry, field, key, value string) error {
 	switch field {
 	case "api_key":
 		entry.APIKey = value
 	case "api_key_cmd":
 		entry.APIKeyCmd = value
+	case "claude_command":
+		entry.ClaudeCommand = value
 	case "url":
 		trimmedURL := strings.TrimSpace(value)
 		if trimmedURL != "" {
@@ -698,7 +772,7 @@ func applyProviderField(providerName string, entry *ProviderEntry, field, key, v
 			entry.AWSProfile = normalized
 		}
 	default:
-		return fmt.Errorf("unknown provider field %q: supported fields are api_key, api_key_cmd, url, protocol, model, models, auth_header, timeout_sec, extra_body, extra_headers, retry_codes, aws_region, aws_profile", field)
+		return fmt.Errorf("unknown provider field %q: supported fields are api_key, api_key_cmd, url, protocol, model, models, auth_header, timeout_sec, extra_body, extra_headers, retry_codes, aws_region, aws_profile, claude_command", field)
 	}
 	return nil
 }
@@ -721,13 +795,10 @@ func parseTimeoutSeconds(value string) (int, error) {
 // The entry's own protocol decides whenever it sets one: a preset's protocol can
 // be overridden per entry (see tryProviderConfig), so `protocol: openai` on the
 // bedrock preset would otherwise still accept AWS settings that nothing reads.
-// Only when the entry is silent does the preset's own AmbientAuth flag answer.
+// Only when the entry is silent does the preset's protocol decide; ambient
+// authentication alone does not imply AWS (the Claude CLI also owns its auth).
 func providerAcceptsAWSSettings(providerName string, entry *ProviderEntry) bool {
-	if entry.Protocol != "" {
-		return llm.NormalizeProtocol(entry.Protocol) == llm.ProtocolAnthropicBedrock
-	}
-	preset, isPreset := llm.LookupProvider(providerName)
-	return isPreset && preset.AmbientAuth
+	return providerProtocol(providerName, *entry) == llm.ProtocolAnthropicBedrock
 }
 
 // normalizeAWSSetting trims the value and rejects the shapes AWS itself will
@@ -768,6 +839,9 @@ func activeModelForProvider(cfg *Config, providerName string, entry ProviderEntr
 	}
 	if cfg != nil && cfg.Provider == providerName && cfg.Model != "" {
 		return cfg.Model
+	}
+	if providerProtocol(providerName, entry) == llm.ProtocolClaudeCode {
+		return "default"
 	}
 	return ""
 }

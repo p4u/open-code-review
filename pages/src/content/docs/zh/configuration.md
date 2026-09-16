@@ -36,13 +36,15 @@ ocr config set providers.anthropic.api_key sk-ant-xxxxxxxxxx
 
 ### 内置 provider
 
-下列 provider 随 OCR 发布，已预置 Base URL 与协议，选中后只需填 API key。
+下列 provider 随 OCR 发布。API provider 已预置 Base URL 与协议；
 若 `providers.<name>.api_key` 未设置，会自动回退到对应的环境变量。
+Bedrock 使用 AWS 凭证链，Claude Code 使用本地 CLI 自行管理的认证，不需要在 OCR 中设置 API key。
 
 | 名称 | 协议 | Base URL | API key 环境变量 |
 |---|---|---|---|
 | `anthropic` | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
 | `bedrock` | anthropic-bedrock | 由 `aws_region` 决定 | —（AWS 凭证链） |
+| `claude-code` | claude-code | 本地 `claude -p` 子进程 | —（Claude Code CLI 自行管理认证） |
 | `openai` | openai | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
 | `openai-responses` | openai-responses | `https://api.openai.com/v1` | `OPENAI_RESPONSES_API_KEY` |
 | `gemini` | openai | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` |

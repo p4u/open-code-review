@@ -19,7 +19,7 @@ to edit it:
 ocr config provider
 ```
 
-It lets you pick a built-in or custom provider, enter an API key, choose a model, saves everything to the config file, and then runs `ocr llm test` once to verify the endpoint. To switch models later:
+It lets you pick a built-in or custom provider and a model, asks for an API key when the provider needs one, saves the configuration, and then runs `ocr llm test` once. Claude Code and Bedrock use their own authentication and skip the API-key prompt. To switch models later:
 
 ```bash
 ocr config model
@@ -38,14 +38,15 @@ ocr config set providers.anthropic.api_key sk-ant-xxxxxxxxxx
 ### Built-in providers
 
 The following providers ship with OCR, with the Base URL and protocol
-preset — once selected, you only need to fill in the API key. If
-`providers.<name>.api_key` is unset, OCR falls back to the corresponding
-environment variable.
+preset. API providers require a key; when `providers.<name>.api_key` is unset,
+OCR falls back to the corresponding environment variable. Bedrock uses AWS
+credentials, and Claude Code uses the installed CLI's own authentication.
 
 | Name | Protocol | Base URL | API key env var |
 |---|---|---|---|
 | `anthropic` | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
 | `bedrock` | anthropic-bedrock | derived from `aws_region` | — (AWS credential chain) |
+| `claude-code` | claude-code | local `claude -p` subprocess | — (Claude Code authentication) |
 | `openai` | openai | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
 | `openai-responses` | openai-responses | `https://api.openai.com/v1` | `OPENAI_RESPONSES_API_KEY` |
 | `gemini` | openai | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` |
@@ -68,9 +69,98 @@ environment variable.
 | `novita` | openai | `https://api.novita.ai/openai` | `NOVITA_API_KEY` |
 | `xai` | openai | `https://api.x.ai/v1` | `XAI_API_KEY` |
 
+### Claude Code CLI (subscription or existing CLI authentication)
+
+The `claude-code` provider runs the installed **Claude Code CLI**, not OCR's
+Anthropic HTTP client. There is no MCP server, no OCR API key, and no fallback
+to a direct API request. Install Claude Code **2.1.273 or later** and authenticate
+it using its own login flow before running OCR:
+
+```bash
+claude auth login
+claude --version
+
+# Use Claude Code for this run without changing your saved OCR provider.
+ocr review --provider claude-code --model default
+ocr scan --provider claude-code --model default --path src
+
+# Or save it as the default for review, scan, and their helper phases.
+ocr config set provider claude-code
+ocr config set model default
+ocr llm test
+```
+
+`default` leaves model selection to Claude Code. An explicit `--model opus`,
+`--model sonnet`, or full model identifier is passed to the CLI unchanged.
+Selecting `--provider claude-code` ignores another provider's saved model.
+Use `--model default` to explicitly restore Claude Code's default selection.
+
+Optional settings:
+
+```bash
+# Executable path, not a shell command or a list of flags.
+ocr config set providers.claude-code.claude_command /absolute/path/to/claude
+ocr config set providers.claude-code.timeout_sec 300
+```
+
+`OCR_LLM_TIMEOUT` also controls the subprocess deadline in seconds. Without a
+saved provider configuration, `OCR_LLM_PROTOCOL=claude-code` selects this backend;
+`OCR_LLM_MODEL` is optional and defaults to `default`. Existing config-file
+precedence is unchanged. HTTP-only OCR settings such as `api_key`, `url`,
+`extra_body`, `extra_headers`, and `retry_codes` are not accepted for this
+backend. Configure gateways through **Claude Code's environment**, not OCR's
+HTTP settings.
+
+**Authentication stays with Claude Code.** The child inherits the caller's
+environment and normal Claude Code login. OCR does not read or copy subscription
+credentials. A user authenticated to the unmodified CLI with a supported Claude
+subscription can use that login. An inherited `ANTHROPIC_API_KEY` can select API
+billing instead, and `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` can select a
+gateway. OCR does not determine how that gateway authenticates or bills usage.
+See [Claude Code authentication](https://code.claude.com/docs/en/authentication)
+and [usage terms](https://code.claude.com/docs/en/legal-and-compliance).
+
+**OCR retains its review engine.** Tool requests are returned as validated
+structured actions, then executed by OCR's existing tools. This preserves
+Git-ref-aware reads, comment validation, task completion, review rounds,
+filtering, scan, sessions, and output formats. Planning and other text-only
+helper phases also use the CLI. Claude Code runs in safe mode with no built-in
+or MCP tools, no session persistence, and a temporary working directory; it
+does not load repository/user customizations. Managed policy still applies.
+OCR deliberately does not use `--bare`, because bare mode disables subscription
+login.
+
+Each completion sends the current OCR conversation snapshot to a fresh CLI
+process. Multi-turn tool results remain in that snapshot, while compression and
+new review rounds can safely replace old history. No global `--continue` session
+is shared between concurrent tasks. This adds process startup and formatting
+overhead compared with a direct API client; lower `--concurrency` if your Claude
+account or gateway imposes tight limits. Request timeouts cancel the CLI process;
+on Unix they also kill its process group. On Windows cancellation terminates the
+direct CLI process, so use the native executable rather than a wrapper that
+spawns detached children.
+
+Token totals include the CLI's internal formatting turns and cached input.
+OCR's completion-token limit is passed through `CLAUDE_CODE_MAX_OUTPUT_TOKENS`,
+subject to the CLI's model-specific caps; there is no CLI equivalent of the API
+`temperature` parameter. `OCR_RAW_LOGGING=1` records the subprocess request/result
+with `transport: "claude-code"`, not its internal HTTP traffic or retry counts.
+These logs contain review content and should be treated as sensitive. Malformed
+or missing structured output, invalid function arguments, missing usage,
+permission denials, and process failures are errors, not successful reviews.
+
+For contributors, the deterministic tests use fake executables and need no
+credentials. The opt-in live tests use the installed CLI and its current
+authentication, consuming account/gateway usage:
+
+```bash
+OCR_TEST_CLAUDE_CODE=1 make test PACKAGES='./internal/llm -run=^TestClaudeCodeLive$$'
+OCR_TEST_CLAUDE_CODE=1 make test PACKAGES='./cmd/opencodereview -run=^TestClaudeCodeEndToEnd$$'
+```
+
 ### Overriding a built-in provider's Base URL
 
-Every built-in provider has a preset Base URL (shown in the table above).
+API-backed providers have preset Base URLs (shown in the table above).
 To point a built-in provider at a different endpoint — for example a
 self-hosted LiteLLM gateway that is rarely at the preset default
 `http://localhost:4000/v1` — set `providers.<name>.url`:
@@ -135,9 +225,9 @@ rather than accepted and ignored.
 
 ### Custom providers
 
-Any provider name not in the table above is treated as custom and must
-supply at least `url` and `protocol` (`protocol` is `anthropic`,
-`openai`, `openai-responses`, or `anthropic-bedrock`):
+Non-built-in provider names are treated as custom. Set `protocol` to
+`anthropic`, `openai`, `openai-responses`, `anthropic-bedrock`, or `claude-code`.
+HTTP API providers also require a `url`:
 
 ```bash
 ocr config set provider                             my-gateway

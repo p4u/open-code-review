@@ -27,13 +27,17 @@ func RawLoggingEnabled() bool {
 	return os.Getenv(rawLoggingEnv) == "1"
 }
 
-// RawRecord is one JSONL line: everything captured about a single HTTP
-// attempt against an LLM endpoint. One logical request may expand into several
-// attempts inside the SDK retry loop, and each attempt gets its own record.
+// RawRecord is one JSONL line captured at the LLM transport boundary. HTTP
+// clients record each attempt, including SDK retries; subprocess clients record
+// each invocation, not the HTTP requests made inside the subprocess.
 //
 // "Raw" is capture-point, not wire-level: on Bedrock the records show the
 // pre-signing request and SSE-normalized response (SigV4 blocks moving in).
 type RawRecord struct {
+	// Transport is omitted for HTTP attempts; "claude-code" marks CLI
+	// invocations whose internal network traffic is not visible to OCR.
+	Transport string `json:"transport,omitempty"`
+
 	// SessionID identifies the review/scan session this attempt belongs to. It
 	// is stamped by the writer, which is bound per session; the middleware
 	// leaves it empty.

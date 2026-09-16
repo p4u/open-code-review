@@ -4,10 +4,29 @@
 package llm
 
 import (
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
 )
+
+func TestLookupProvider_ClaudeCodeDetails(t *testing.T) {
+	p, ok := LookupProvider("  Claude-Code  ")
+	if !ok || p.Name != "claude-code" || p.Protocol != ProtocolClaudeCode || !p.AmbientAuth {
+		t.Fatalf("invalid Claude Code preset: %+v, found=%v", p, ok)
+	}
+	if p.BaseURL != "" || p.EnvVar != "" || p.AuthHeader != "" {
+		t.Fatal("Claude Code must not configure HTTP authentication or an endpoint")
+	}
+	if !reflect.DeepEqual(p.Models, []string{"default", "opus", "sonnet", "haiku"}) {
+		t.Fatalf("unexpected model aliases: %v", p.Models)
+	}
+	p.Models[0] = "changed"
+	p, _ = LookupProvider("claude-code")
+	if p.Models[0] != "default" {
+		t.Fatal("preset model list was aliased")
+	}
+}
 
 func TestLookupProvider_KnownProviders(t *testing.T) {
 	names := []string{"anthropic", "openai", "dashscope", "edenai"}
@@ -76,7 +95,7 @@ func TestListProviders_Order(t *testing.T) {
 	if len(providers) < 3 {
 		t.Fatalf("expected at least 3 providers, got %d", len(providers))
 	}
-	expected := []string{"anthropic", "baidu-qianfan", "bedrock", "dashscope", "dashscope-tokenplan", "deepseek", "edenai", "gemini", "hy-tokenplan", "iflytek", "kimi", "kimi-global", "litellm", "mimo", "minimax", "minimax-cn", "mistral", "novita", "ollama-cloud", "openai", "openai-responses", "siliconflow", "siliconflow-cn", "tencent-tokenhub", "volcengine", "xai", "z-ai", "z-ai-coding"}
+	expected := []string{"anthropic", "baidu-qianfan", "bedrock", "claude-code", "dashscope", "dashscope-tokenplan", "deepseek", "edenai", "gemini", "hy-tokenplan", "iflytek", "kimi", "kimi-global", "litellm", "mimo", "minimax", "minimax-cn", "mistral", "novita", "ollama-cloud", "openai", "openai-responses", "siliconflow", "siliconflow-cn", "tencent-tokenhub", "volcengine", "xai", "z-ai", "z-ai-coding"}
 	if len(providers) != len(expected) {
 		t.Fatalf("expected %d providers, got %d", len(expected), len(providers))
 	}

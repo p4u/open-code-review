@@ -40,15 +40,17 @@ ocr config set providers.anthropic.api_key sk-ant-xxxxxxxxxx
 
 ### Встроенные провайдеры
 
-Перечисленные ниже провайдеры поставляются вместе с OCR; для них заранее
-заданы базовый URL и протокол, поэтому после выбора достаточно указать
-API-ключ. Если `providers.<name>.api_key` не задан, OCR использует
-соответствующую переменную окружения.
+Перечисленные ниже провайдеры поставляются вместе с OCR. Для API-провайдеров
+заранее заданы базовый URL и протокол. Если `providers.<name>.api_key` не задан,
+OCR использует соответствующую переменную окружения. Bedrock использует цепочку
+учётных данных AWS, а Claude Code — аутентификацию локального CLI; API-ключ в
+конфигурации OCR для них не требуется.
 
 | Имя | Протокол | Базовый URL | Переменная окружения для API-ключа |
 |---|---|---|---|
 | `anthropic` | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
 | `bedrock` | anthropic-bedrock | определяется `aws_region` | — (цепочка учётных данных AWS) |
+| `claude-code` | claude-code | локальный подпроцесс `claude -p` | — (аутентификацией управляет Claude Code CLI) |
 | `openai` | openai | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
 | `openai-responses` | openai-responses | `https://api.openai.com/v1` | `OPENAI_RESPONSES_API_KEY` |
 | `gemini` | openai | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` |

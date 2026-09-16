@@ -111,6 +111,7 @@ func applyManualConfig(configPath string, cfg *Config, result providerTUIResult)
 	cfg.Provider = ""
 	cfg.Model = ""
 	cfg.Llm.URL = result.url
+	cfg.Llm.ClaudeCommand = "" // The manual form selects an HTTP transport.
 	cfg.Llm.Model = result.model
 	cfg.Llm.AuthToken = result.apiKey
 	authHeader, err := llm.NormalizeAuthHeader(result.authHeader)
@@ -191,6 +192,9 @@ func applyCustomProviderConfig(configPath string, cfg *Config, result providerTU
 	} else {
 		entry.APIKey = ""
 	}
+	if err := validateProviderEntry(result.provider, entry); err != nil {
+		return err
+	}
 	cfg.CustomProviders[result.provider] = entry
 
 	if !result.isEdit {
@@ -238,8 +242,8 @@ func applyCustomProviderConfig(configPath string, cfg *Config, result providerTU
 // here and then fail resolution with "no api_key or api_key_cmd configured".
 //
 // An ambient-auth provider has no credential to save at all: demanding one would
-// make it impossible to configure, since the credentials live in the AWS chain
-// rather than the config file.
+// make it impossible to configure, since authentication belongs to the transport
+// (the AWS chain or the Claude CLI) rather than the config file.
 func checkAPIKeyRequirement(providerName, apiKey, apiKeyCmd string, preset llm.Provider, isPreset bool) error {
 	if apiKey != "" || strings.TrimSpace(apiKeyCmd) != "" {
 		return nil
@@ -267,6 +271,7 @@ func applyOfficialProviderConfig(configPath string, cfg *Config, result provider
 	}
 
 	preset, isPreset := llm.LookupProvider(result.provider)
+	preset.AmbientAuth = ambientProviderProtocol(providerProtocol(result.provider, cfg.Providers[result.provider]))
 
 	if err := checkAPIKeyRequirement(result.provider, result.apiKey, cfg.Providers[result.provider].APIKeyCmd, preset, isPreset); err != nil {
 		return err
@@ -287,6 +292,9 @@ func applyOfficialProviderConfig(configPath string, cfg *Config, result provider
 		// Confirmed empty key: clear saved api_key so the resolver falls back to
 		// api_key_cmd (when set) or $ENV_VAR.
 		entry.APIKey = ""
+	}
+	if err := validateProviderEntry(result.provider, entry); err != nil {
+		return err
 	}
 	cfg.Providers[result.provider] = entry
 
@@ -338,6 +346,8 @@ func runConfigModel() error {
 		registryModels = append([]string(nil), preset.Models...)
 		if entry, ok := cfg.Providers[cfg.Provider]; ok {
 			currentModel = activeModelForProvider(cfg, cfg.Provider, entry)
+			provider.Protocol = providerProtocol(cfg.Provider, entry)
+			provider.AmbientAuth = ambientProviderProtocol(provider.Protocol)
 			provider.Models = mergeModelLists(provider.Models, entry.Models)
 			// Surface the effective Base URL: a configured override takes
 			// precedence over the preset default so users can confirm their

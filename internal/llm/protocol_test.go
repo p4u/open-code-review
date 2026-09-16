@@ -18,6 +18,8 @@ func TestNormalizeProtocol(t *testing.T) {
 		{"canonical anthropic is idempotent", ProtocolAnthropic, ProtocolAnthropic},
 		{"canonical openai is idempotent", ProtocolOpenAIChatCompletions, ProtocolOpenAIChatCompletions},
 		{"canonical openai-responses is idempotent", ProtocolOpenAIResponses, ProtocolOpenAIResponses},
+		{"canonical claude-code is idempotent", ProtocolClaudeCode, ProtocolClaudeCode},
+		{"claude-code case and whitespace normalize", "  Claude-Code  ", ProtocolClaudeCode},
 		{"anthropic case-insensitive", "ANTHROPIC", ProtocolAnthropic},
 		{"openai-responses case-insensitive", "OpenAI-Responses", ProtocolOpenAIResponses},
 		{"unknown passthrough lowercased", "gRPC", "grpc"},
@@ -42,6 +44,7 @@ func TestValidateProtocol(t *testing.T) {
 		{"anthropic ok", ProtocolAnthropic, false, ""},
 		{"openai ok", ProtocolOpenAIChatCompletions, false, ""},
 		{"openai-responses ok", ProtocolOpenAIResponses, false, ""},
+		{"claude-code ok", ProtocolClaudeCode, false, ""},
 		{"empty rejected", "", true, "unsupported protocol"},
 		{"grpc rejected", "grpc", true, "unsupported protocol"},
 		{"anthropic-vertex rejected", "anthropic-vertex", true, "unsupported protocol"},
@@ -73,7 +76,7 @@ func TestValidateProtocol_ErrorMessageListsAllProtocols(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	for _, sub := range []string{ProtocolAnthropic, ProtocolOpenAIChatCompletions, ProtocolOpenAIResponses} {
+	for _, sub := range []string{ProtocolAnthropic, ProtocolOpenAIChatCompletions, ProtocolOpenAIResponses, ProtocolAnthropicBedrock, ProtocolClaudeCode} {
 		if !strings.Contains(err.Error(), sub) {
 			t.Errorf("error %q should mention %q", err.Error(), sub)
 		}

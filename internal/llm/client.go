@@ -382,6 +382,10 @@ type ClientConfig struct {
 	// Empty means the standard AWS credential chain decides.
 	AWSProfile string
 	AWSRegion  string
+
+	// ClaudeCommand is an executable name or path, never a shell command.
+	// Empty uses "claude" from PATH.
+	ClaudeCommand string
 }
 
 // retryCodesMiddleware returns an HTTP middleware that forces the SDK to retry
@@ -440,12 +444,15 @@ func NewLLMClient(ep ResolvedEndpoint, collector *RetryCollector, raw *RawHolder
 		rawHolder:      raw,
 		AWSProfile:     ep.AWSProfile,
 		AWSRegion:      ep.AWSRegion,
+		ClaudeCommand:  ep.ClaudeCommand,
 	}
 	switch ep.Protocol {
 	case ProtocolAnthropic:
 		return NewAnthropicClient(cfg)
 	case ProtocolAnthropicBedrock:
 		return NewAnthropicBedrockClient(cfg)
+	case ProtocolClaudeCode:
+		return NewClaudeCodeClient(cfg)
 	case ProtocolOpenAIResponses:
 		return NewOpenAIResponsesClient(cfg)
 	default:

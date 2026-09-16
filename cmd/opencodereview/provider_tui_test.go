@@ -2771,6 +2771,7 @@ func TestCpProtocols_ContainsAllCanonicalNames(t *testing.T) {
 		llm.ProtocolOpenAIChatCompletions,
 		llm.ProtocolOpenAIResponses,
 		llm.ProtocolAnthropicBedrock,
+		llm.ProtocolClaudeCode,
 	}
 	if len(cpProtocols) != len(want) {
 		t.Fatalf("cpProtocols has %d entries, want %d", len(cpProtocols), len(want))
@@ -2781,7 +2782,7 @@ func TestCpProtocols_ContainsAllCanonicalNames(t *testing.T) {
 		}
 	}
 
-	wantManual := want[:len(want)-1]
+	wantManual := want[:3]
 	if len(manualProtocols) != len(wantManual) {
 		t.Fatalf("manualProtocols has %d entries, want %d", len(manualProtocols), len(wantManual))
 	}
@@ -2791,8 +2792,8 @@ func TestCpProtocols_ContainsAllCanonicalNames(t *testing.T) {
 		}
 	}
 	for _, p := range manualProtocols {
-		if p == llm.ProtocolAnthropicBedrock {
-			t.Error("manualProtocols offers bedrock; the llm block has no region, profile or use for its url and token")
+		if ambientProviderProtocol(p) {
+			t.Errorf("manualProtocols offers %s, which has no URL or key to collect", p)
 		}
 	}
 }

@@ -62,12 +62,12 @@ var cpProtocols = []string{
 	llm.ProtocolOpenAIChatCompletions,
 	llm.ProtocolOpenAIResponses,
 	llm.ProtocolAnthropicBedrock,
+	llm.ProtocolClaudeCode,
 }
 
 // manualProtocols lists the protocol options offered in the Manual form, which
-// writes llm.url and llm.auth_token. Bedrock is deliberately absent: that block
-// holds no region or profile, and bedrock uses neither the url nor the token it
-// does hold, so the resolver rejects the combination outright.
+// writes llm.url and llm.auth_token. Ambient transports are deliberately absent:
+// they have no URL or key to collect. Configure those in the provider tabs.
 var manualProtocols = []string{
 	llm.ProtocolAnthropic,
 	llm.ProtocolOpenAIChatCompletions,
@@ -198,7 +198,22 @@ type providerTUIModel struct {
 // ends at the protocol step instead of walking three fields that would be
 // written as dead config.
 func (m providerTUIModel) cpAmbientProtocol() bool {
-	return cpProtocols[m.cpProtocolIdx] == llm.ProtocolAnthropicBedrock
+	return ambientProviderProtocol(cpProtocols[m.cpProtocolIdx])
+}
+
+func ambientProviderProtocol(protocol string) bool {
+	return protocol == llm.ProtocolAnthropicBedrock || protocol == llm.ProtocolClaudeCode
+}
+
+func (m providerTUIModel) selectedProviderProtocol() string {
+	if cp, ok := m.selectedCustomProvider(); ok {
+		return providerProtocol(cp.name, m.customProviderEntry(cp.name, cp.entry))
+	}
+	p := m.currentProvider()
+	if m.existingCfg != nil {
+		return providerProtocol(p.Name, m.existingCfg.Providers[p.Name])
+	}
+	return p.Protocol
 }
 
 func cpProtocolIndex(protocol string) int {
@@ -983,6 +998,9 @@ func (m providerTUIModel) apiKeyCmdForStep() string {
 }
 
 func (m providerTUIModel) apiKeyStepCanConfirm() (ok bool, errMsg string) {
+	if ambientProviderProtocol(m.selectedProviderProtocol()) {
+		return true, ""
+	}
 	if m.apiKeyOriginal != "" {
 		return true, ""
 	}
@@ -997,11 +1015,6 @@ func (m providerTUIModel) apiKeyStepCanConfirm() (ok bool, errMsg string) {
 	}
 	if m.activeTab == tabOfficial {
 		p := m.currentProvider()
-		if p.AmbientAuth {
-			// Reachable when an existing config is edited: an empty key is the
-			// correct state for a provider that signs from the AWS chain.
-			return true, ""
-		}
 		if officialProviderEnvKeySet(p) {
 			return true, ""
 		}
@@ -1119,6 +1132,24 @@ func (m *providerTUIModel) enterEditCustomProvider() {
 		m.apiKeyMasked = false
 		m.apiKeyOriginal = ""
 	}
+}
+
+// customProviderCLITransition identifies an explicit transport change in the
+// edit form. Unchanged protocols must retain their configured transport options.
+func (m providerTUIModel) customProviderCLITransition() (fromCLI, toCLI bool) {
+	if !m.editingCustom || m.existingCfg == nil {
+		return false, false
+	}
+	entry, ok := m.existingCfg.CustomProviders[m.editTargetName]
+	if !ok {
+		return false, false
+	}
+	previous := llm.NormalizeProtocol(entry.Protocol)
+	next := cpProtocols[m.cpProtocolIdx]
+	if previous == next {
+		return false, false
+	}
+	return previous == llm.ProtocolClaudeCode, next == llm.ProtocolClaudeCode
 }
 
 func authHeaderFormError(raw string) string {
@@ -1252,8 +1283,12 @@ func (m providerTUIModel) applyCreateCustomProvider() (tea.Model, tea.Cmd) {
 		AuthHeader: r.authHeader,
 		APIKey:     strings.TrimSpace(m.apiKeyInput.Value()),
 	}
-	if r.protocol == llm.ProtocolAnthropicBedrock {
+	if ambientProviderProtocol(r.protocol) {
 		entry.APIKey = ""
+	}
+	if r.protocol == llm.ProtocolClaudeCode {
+		preset, _ := llm.LookupProvider("claude-code")
+		entry.Models = preset.Models
 	}
 	m.existingCfg.CustomProviders[r.provider] = entry
 
@@ -1288,17 +1323,18 @@ func (m providerTUIModel) applyCreateCustomProvider() (tea.Model, tea.Cmd) {
 // original's slice or map fields.
 func cloneProviderEntry(v ProviderEntry) ProviderEntry {
 	out := ProviderEntry{
-		APIKey:     v.APIKey,
-		APIKeyCmd:  v.APIKeyCmd,
-		URL:        v.URL,
-		Protocol:   v.Protocol,
-		Model:      v.Model,
-		Models:     append([]string(nil), v.Models...),
-		AuthHeader: v.AuthHeader,
-		TimeoutSec: v.TimeoutSec,
-		RetryCodes: append([]int(nil), v.RetryCodes...),
-		AWSProfile: v.AWSProfile,
-		AWSRegion:  v.AWSRegion,
+		APIKey:        v.APIKey,
+		APIKeyCmd:     v.APIKeyCmd,
+		URL:           v.URL,
+		Protocol:      v.Protocol,
+		Model:         v.Model,
+		Models:        append([]string(nil), v.Models...),
+		AuthHeader:    v.AuthHeader,
+		TimeoutSec:    v.TimeoutSec,
+		RetryCodes:    append([]int(nil), v.RetryCodes...),
+		AWSProfile:    v.AWSProfile,
+		AWSRegion:     v.AWSRegion,
+		ClaudeCommand: v.ClaudeCommand,
 	}
 	if v.ExtraBody != nil {
 		out.ExtraBody = make(map[string]any, len(v.ExtraBody))
@@ -1371,8 +1407,27 @@ func (m *providerTUIModel) applyEditCustomProviderSave() error {
 	}
 	// Switching an entry to an ambient protocol drops the key it no longer uses,
 	// rather than leaving a live credential in a file nothing reads it from.
-	if entry.Protocol == llm.ProtocolAnthropicBedrock {
+	if ambientProviderProtocol(entry.Protocol) {
 		entry.APIKey = ""
+	}
+	// The edit form cannot expose every transport-specific setting. On an
+	// explicit CLI switch, remove only options the destination cannot honor;
+	// ordinary edits must preserve them. The form previews this cleanup.
+	fromCLI, toCLI := m.customProviderCLITransition()
+	if toCLI {
+		entry.APIKeyCmd = ""
+		entry.ExtraBody = nil
+		entry.ExtraHeaders = nil
+		entry.RetryCodes = nil
+		entry.AWSProfile = ""
+		entry.AWSRegion = ""
+	}
+	if fromCLI {
+		entry.ClaudeCommand = ""
+	}
+	if err := validateProviderEntry(r.provider, entry); err != nil {
+		m.formError = err.Error()
+		return err
 	}
 	// If name changed, delete old key
 	if r.editTargetName != "" && r.editTargetName != r.provider {
@@ -1856,7 +1911,7 @@ func (m providerTUIModel) handleEnter() (tea.Model, tea.Cmd) {
 			m.formError = err.Error()
 			return m, nil
 		}
-		if m.activeTab == tabOfficial && m.currentProvider().AmbientAuth {
+		if ambientProviderProtocol(m.selectedProviderProtocol()) {
 			// An ambient-auth provider has no key to collect, so the model step
 			// is the last one. Showing an API-key prompt that must be left blank
 			// would read as a step the user failed to complete.
@@ -1976,6 +2031,10 @@ func (m providerTUIModel) result() providerTUIResult {
 			apiKey = strings.TrimSpace(m.apiKeyInput.Value())
 		}
 
+		if ambientProviderProtocol(m.selectedProviderProtocol()) {
+			apiKey = ""
+		}
+
 		return providerTUIResult{
 			provider:         p.Name,
 			model:            model,
@@ -2033,6 +2092,9 @@ func (m providerTUIModel) result() providerTUIResult {
 				apiKey = m.apiKeyOriginal
 			} else {
 				apiKey = strings.TrimSpace(m.apiKeyInput.Value())
+			}
+			if ambientProviderProtocol(m.selectedProviderProtocol()) {
+				apiKey = ""
 			}
 			return providerTUIResult{
 				provider:         cp.name,
@@ -2239,6 +2301,14 @@ func (m providerTUIModel) viewCustomProviderForm(s *strings.Builder) {
 	}
 	s.WriteString(tuiTitleStyle.Render(title))
 	s.WriteString("\n\n")
+	fromCLI, toCLI := m.customProviderCLITransition()
+	if toCLI {
+		s.WriteString(tuiDimStyle.Render("  Switching to claude-code clears saved HTTP credentials/options and AWS region/profile."))
+		s.WriteString("\n\n")
+	} else if fromCLI {
+		s.WriteString(tuiDimStyle.Render("  Switching away from claude-code clears the saved claude_command executable path."))
+		s.WriteString("\n\n")
+	}
 
 	type field struct {
 		label  string
@@ -2274,8 +2344,11 @@ func (m providerTUIModel) viewCustomProviderForm(s *strings.Builder) {
 						s.WriteString(cur + tuiItemStyle.Render(proto) + "\n")
 					}
 				}
-				if m.cpAmbientProtocol() {
+				switch cpProtocols[m.cpProtocolIdx] {
+				case llm.ProtocolAnthropicBedrock:
 					s.WriteString(tuiDimStyle.Render("    credentials come from the AWS chain; pin a region or profile with `ocr config set custom_providers."+m.cpNameInput.Value()+".aws_region <r>`") + "\n")
+				case llm.ProtocolClaudeCode:
+					s.WriteString(tuiDimStyle.Render("    authentication comes from the Claude CLI; set a different executable with `ocr config set custom_providers."+m.cpNameInput.Value()+".claude_command <path>`") + "\n")
 				}
 			case cpStepBaseURL:
 				s.WriteString("    " + m.cpURLInput.View() + "\n")
@@ -2393,6 +2466,10 @@ func (m providerTUIModel) viewManualTab(s *strings.Builder) {
 func (m providerTUIModel) viewModel(s *strings.Builder) {
 	s.WriteString(tuiTitleStyle.Render(fmt.Sprintf("  Select a model (%s)", m.modelProviderName())))
 	s.WriteString("\n\n")
+	if m.selectedProviderProtocol() == llm.ProtocolClaudeCode {
+		s.WriteString(tuiDimStyle.Render("  default uses the Claude CLI's configured model and authentication."))
+		s.WriteString("\n\n")
+	}
 
 	models := m.models()
 
@@ -3080,7 +3157,10 @@ func (m modelTUIModel) View() tea.View {
 	s.WriteString("\n")
 	s.WriteString(tuiTitleStyle.Render(fmt.Sprintf("  Select a model (%s)", m.provider.DisplayName)))
 	s.WriteString("\n")
-	if m.provider.BaseURL != "" {
+	if llm.NormalizeProtocol(m.provider.Protocol) == llm.ProtocolClaudeCode {
+		s.WriteString(tuiDimStyle.Render("  default uses the Claude CLI's configured model and authentication."))
+		s.WriteString("\n")
+	} else if m.provider.BaseURL != "" {
 		s.WriteString(tuiDimStyle.Render(fmt.Sprintf("  Base URL: %s", m.provider.BaseURL)))
 		s.WriteString("\n")
 	}

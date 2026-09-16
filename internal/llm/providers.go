@@ -15,6 +15,7 @@ import (
 //   - ProtocolOpenAIChatCompletions ("openai")
 //   - ProtocolOpenAIResponses ("openai-responses")
 //   - ProtocolAnthropicBedrock ("anthropic-bedrock")
+//   - ProtocolClaudeCode ("claude-code")
 //
 // To add a built-in provider that speaks a different protocol, set Protocol
 // accordingly and ensure NewLLMClient has a matching case.
@@ -36,6 +37,15 @@ type Provider struct {
 }
 
 var registry = []Provider{
+	{
+		Name:        "claude-code",
+		DisplayName: "Claude Code CLI (local authentication)",
+		Protocol:    ProtocolClaudeCode,
+		AmbientAuth: true,
+		// "default" leaves the model selection to the CLI's own configuration.
+		// Aliases seed the picker; custom model IDs remain valid.
+		Models: []string{"default", "opus", "sonnet", "haiku"},
+	},
 	{
 		Name:        "anthropic",
 		DisplayName: "Anthropic Claude API",

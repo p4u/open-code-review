@@ -9,6 +9,22 @@ Install the bundled command so OCR runs end-to-end inside
 the diff, classify findings, and automatically apply fixes for the
 ones worth adopting.
 
+## Use Claude Code as OCR's model backend
+
+To run OCR itself through your authenticated Claude Code CLI, rather than a
+separately configured model API, select the `claude-code` provider:
+
+```bash
+ocr review --provider claude-code --model default
+ocr scan --provider claude-code --model default --path src
+```
+
+This needs no plugin or MCP server. OCR retains its review loop and tools while
+`claude -p` supplies the model responses. See [Claude Code CLI configuration](../../configuration/#claude-code-cli-subscription-or-existing-cli-authentication)
+for installation, subscription authentication, gateway environment variables,
+and persistent configuration. This is different from delegation mode, where
+Claude Code drives the review, and from the auto-fixing plugin described below.
+
 ## What ships in the repo
 
 The repo ships a Claude Code plugin under

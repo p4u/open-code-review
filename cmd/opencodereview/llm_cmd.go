@@ -118,6 +118,8 @@ func runLLMTest() error {
 		} else {
 			fmt.Printf("Profile: (from the ambient AWS chain)\n")
 		}
+	} else if ep.Protocol == llm.ProtocolClaudeCode {
+		fmt.Println("Backend: Claude Code CLI (inherited authentication)")
 	} else {
 		fmt.Printf("URL:    %s\n", ep.URL)
 	}
@@ -150,7 +152,11 @@ func runLLMProviders() {
 	fmt.Fprintf(w, "  NAME\tPROTOCOL\tBASE URL\n")
 	fmt.Fprintf(w, "  ----\t--------\t--------\n")
 	for _, p := range providers {
-		fmt.Fprintf(w, "  %s\t%s\t%s\n", p.Name, p.Protocol, p.BaseURL)
+		endpoint := p.BaseURL
+		if p.Protocol == llm.ProtocolClaudeCode {
+			endpoint = "(local subprocess)"
+		}
+		fmt.Fprintf(w, "  %s\t%s\t%s\n", p.Name, p.Protocol, endpoint)
 	}
 	if err := w.Flush(); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to flush output: %v\n", err)

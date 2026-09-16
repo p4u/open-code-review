@@ -44,6 +44,10 @@ type ResolvedEndpoint struct {
 	// providers. Empty means "let the AWS SDK decide".
 	AWSProfile string
 	AWSRegion  string
+
+	// ClaudeCommand is an executable name or path for the claude-code protocol.
+	// Empty uses "claude" from PATH; arguments and shell expansion are not supported.
+	ClaudeCommand string
 }
 
 // Environment variable names for OCR-specific configuration.
@@ -120,7 +124,7 @@ func ResolveEndpointWithOptions(configPath string, opts ResolveOptions) (Resolve
 			}
 			return ResolvedEndpoint{}, fmt.Errorf("resolve OCR config file: provider %q is not configured in %s section because the config file does not exist", opts.Provider, section)
 		}
-		return finalizeResolvedEndpoint("OCR config file", ep, env), nil
+		return finalizeResolvedEndpoint("OCR config file", ep, env)
 	}
 
 	strategies := []struct {
@@ -142,7 +146,7 @@ func ResolveEndpointWithOptions(configPath string, opts ResolveOptions) (Resolve
 		// transport supplies both. Everything else still needs all three.
 		complete := ep.Model != "" && (ep.AmbientAuth || (ep.URL != "" && ep.Token != ""))
 		if ok && complete {
-			return finalizeResolvedEndpoint(strategy.name, ep, env), nil
+			return finalizeResolvedEndpoint(strategy.name, ep, env)
 		}
 	}
 
@@ -176,11 +180,19 @@ func parseEnvOverrides() (envOverrides, error) {
 
 // finalizeResolvedEndpoint stamps the source label, strips the model suffix and
 // applies the global env overrides, which win over config-file values.
-func finalizeResolvedEndpoint(source string, ep ResolvedEndpoint, env envOverrides) ResolvedEndpoint {
+func finalizeResolvedEndpoint(source string, ep ResolvedEndpoint, env envOverrides) (ResolvedEndpoint, error) {
 	if ep.Source == "" {
 		ep.Source = source
 	}
-	ep.Model = stripModelSuffix(ep.Model)
+	if ep.Protocol == ProtocolClaudeCode {
+		if len(env.headers) > 0 {
+			return ResolvedEndpoint{}, fmt.Errorf("%s is not supported by claude-code; configure transport in the Claude CLI instead", envOCRLLMExtraHeaders)
+		}
+		// CLI model aliases may include a context suffix such as sonnet[1m].
+		// Unlike direct HTTP model IDs, they must reach the CLI unchanged.
+	} else {
+		ep.Model = stripModelSuffix(ep.Model)
+	}
 	if env.hasTimeout {
 		ep.Timeout = env.timeout
 	}
@@ -193,7 +205,7 @@ func finalizeResolvedEndpoint(source string, ep ResolvedEndpoint, env envOverrid
 			}
 		}
 	}
-	return ep
+	return ep, nil
 }
 
 // parseTimeoutEnv reads and validates the OCR_LLM_TIMEOUT environment variable.
@@ -255,6 +267,13 @@ func tryOCREnv(modelOverride string) (ResolvedEndpoint, bool, error) {
 	if modelOverride != "" {
 		model = modelOverride
 	}
+	if NormalizeProtocol(os.Getenv(envOCRLLMProtocol)) == ProtocolClaudeCode {
+		ep, err := resolveClaudeCodeConfig(ClientConfig{
+			URL: url, APIKey: token, Model: model, AuthHeader: os.Getenv(envOCRLLMAuthHeader),
+		}, "", 0)
+		ep.Source = "OCR environment"
+		return ep, err == nil, err
+	}
 	if url == "" || token == "" || model == "" {
 		return ResolvedEndpoint{}, false, nil
 	}
@@ -300,17 +319,18 @@ func tryOCREnv(modelOverride string) (ResolvedEndpoint, bool, error) {
 
 // llmFileConfig represents the llm section in config.json.
 type llmFileConfig struct {
-	URL          string            `json:"url,omitempty"`
-	AuthToken    string            `json:"auth_token,omitempty"`
-	AuthHeader   string            `json:"auth_header,omitempty"`
-	Model        string            `json:"model,omitempty"`
-	AuthTokenCmd string            `json:"auth_token_cmd,omitempty"` // shell command whose stdout is the auth token; used when auth_token is empty
-	Protocol     string            `json:"protocol,omitempty"`       // anthropic|openai|openai-responses; takes priority over use_anthropic
-	UseAnthropic *bool             `json:"use_anthropic,omitempty"`  // pointer to distinguish unset from false; legacy fallback when protocol is empty
-	TimeoutSec   int               `json:"timeout_sec,omitempty"`    // per-request HTTP timeout in seconds
-	ExtraBody    map[string]any    `json:"extra_body,omitempty"`
-	ExtraHeaders map[string]string `json:"extra_headers,omitempty"`
-	RetryCodes   []int             `json:"retry_codes,omitempty"`
+	URL           string            `json:"url,omitempty"`
+	AuthToken     string            `json:"auth_token,omitempty"`
+	AuthHeader    string            `json:"auth_header,omitempty"`
+	Model         string            `json:"model,omitempty"`
+	AuthTokenCmd  string            `json:"auth_token_cmd,omitempty"` // shell command whose stdout is the auth token; used when auth_token is empty
+	Protocol      string            `json:"protocol,omitempty"`       // anthropic|openai|openai-responses; takes priority over use_anthropic
+	UseAnthropic  *bool             `json:"use_anthropic,omitempty"`  // pointer to distinguish unset from false; legacy fallback when protocol is empty
+	TimeoutSec    int               `json:"timeout_sec,omitempty"`    // per-request HTTP timeout in seconds
+	ExtraBody     map[string]any    `json:"extra_body,omitempty"`
+	ExtraHeaders  map[string]string `json:"extra_headers,omitempty"`
+	RetryCodes    []int             `json:"retry_codes,omitempty"`
+	ClaudeCommand string            `json:"claude_command,omitempty"`
 }
 
 // providerEntryConfig represents a single provider entry in config.json.
@@ -331,8 +351,9 @@ type providerEntryConfig struct {
 	// SigV4 (currently bedrock). Both are optional: without them the standard
 	// AWS chain decides, same as any other AWS tool. Setting them in config
 	// makes a review run reproducible without exporting AWS_PROFILE first.
-	AWSProfile string `json:"aws_profile,omitempty"`
-	AWSRegion  string `json:"aws_region,omitempty"`
+	AWSProfile    string `json:"aws_profile,omitempty"`
+	AWSRegion     string `json:"aws_region,omitempty"`
+	ClaudeCommand string `json:"claude_command,omitempty"`
 }
 
 type configFile struct {
@@ -348,6 +369,9 @@ func tryOCRConfig(path string, opts ResolveOptions) (ResolvedEndpoint, bool, err
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if preset, ok := LookupProvider(opts.Provider); ok && preset.Protocol == ProtocolClaudeCode {
+				return tryProviderConfig(configFile{Provider: opts.Provider}, opts.Model)
+			}
 			return ResolvedEndpoint{}, false, nil
 		}
 		return ResolvedEndpoint{}, false, err
@@ -382,12 +406,43 @@ func tryProviderConfig(cfg configFile, modelOverride string) (ResolvedEndpoint, 
 	} else {
 		entry, ok = cfg.CustomProviders[cfg.Provider]
 	}
-	if !ok {
+	// The CLI preset needs no stored configuration: the subprocess owns auth
+	// and model defaults. Other presets retain the existing admission checks.
+	if !ok && !(isPreset && preset.Protocol == ProtocolClaudeCode) {
 		section := "providers"
 		if !isPreset {
 			section = "custom_providers"
 		}
 		return ResolvedEndpoint{}, false, fmt.Errorf("provider %q is set but not configured in %s section", cfg.Provider, section)
+	}
+
+	protocol := NormalizeProtocol(entry.Protocol)
+	if protocol == "" && isPreset {
+		protocol = preset.Protocol
+	}
+	if protocol == ProtocolClaudeCode {
+		model := cfg.Model
+		if entry.Model != "" {
+			model = entry.Model
+		}
+		if modelOverride != "" {
+			model = modelOverride
+		}
+		ep, err := resolveClaudeCodeConfig(ClientConfig{
+			URL: entry.URL, APIKey: entry.APIKey, AuthHeader: entry.AuthHeader,
+			Model: model, ClaudeCommand: entry.ClaudeCommand,
+			ExtraBody: entry.ExtraBody, ExtraHeaders: entry.ExtraHeaders, RetryCodes: entry.RetryCodes,
+			AWSProfile: entry.AWSProfile, AWSRegion: entry.AWSRegion,
+		}, entry.APIKeyCmd, entry.TimeoutSec)
+		if err != nil {
+			return ResolvedEndpoint{}, false, fmt.Errorf("provider %q: %w", cfg.Provider, err)
+		}
+		ep.Provider = cfg.Provider
+		ep.Source = "provider:" + cfg.Provider
+		return ep, true, nil
+	}
+	if entry.ClaudeCommand != "" {
+		return ResolvedEndpoint{}, false, fmt.Errorf("provider %q: claude_command requires protocol %q", cfg.Provider, ProtocolClaudeCode)
 	}
 
 	// Pick the credential source here, but run api_key_cmd only just before
@@ -427,7 +482,7 @@ func tryProviderConfig(cfg configFile, modelOverride string) (ResolvedEndpoint, 
 			apiKey = v
 		}
 	}
-	var url, protocol, authHeader, model string
+	var url, authHeader, model string
 	var extraBody map[string]any
 
 	if isPreset {
@@ -596,11 +651,45 @@ func tryProviderConfig(cfg configFile, modelOverride string) (ResolvedEndpoint, 
 	}, true, nil
 }
 
+// resolveClaudeCodeConfig validates before anything can launch a subprocess or
+// fall back to an HTTP credential source. A missing model uses the CLI default.
+func resolveClaudeCodeConfig(cfg ClientConfig, keyCmd string, timeoutSec int) (ResolvedEndpoint, error) {
+	if keyCmd != "" {
+		return ResolvedEndpoint{}, fmt.Errorf("claude-code does not support api_key_cmd/auth_token_cmd; authentication is managed by the Claude CLI")
+	}
+	if err := ValidateClaudeCodeConfig(cfg); err != nil {
+		return ResolvedEndpoint{}, err
+	}
+	timeout, err := ValidateTimeoutSec(timeoutSec)
+	if err != nil {
+		return ResolvedEndpoint{}, err
+	}
+	model := strings.TrimSpace(cfg.Model)
+	if model == "" {
+		model = "default"
+	}
+	return ResolvedEndpoint{
+		Protocol: ProtocolClaudeCode, AmbientAuth: true,
+		Model: model, ClaudeCommand: cfg.ClaudeCommand, Timeout: timeout,
+	}, nil
+}
+
 // tryLegacyLlmConfig resolves an endpoint from the legacy llm config block.
 func tryLegacyLlmConfig(cfg configFile, modelOverride string) (ResolvedEndpoint, bool, error) {
 	model := cfg.Llm.Model
 	if modelOverride != "" {
 		model = modelOverride
+	}
+	if NormalizeProtocol(cfg.Llm.Protocol) == ProtocolClaudeCode {
+		ep, err := resolveClaudeCodeConfig(ClientConfig{
+			URL: cfg.Llm.URL, APIKey: cfg.Llm.AuthToken, AuthHeader: cfg.Llm.AuthHeader,
+			Model: model, ClaudeCommand: cfg.Llm.ClaudeCommand,
+			ExtraBody: cfg.Llm.ExtraBody, ExtraHeaders: cfg.Llm.ExtraHeaders, RetryCodes: cfg.Llm.RetryCodes,
+		}, cfg.Llm.AuthTokenCmd, cfg.Llm.TimeoutSec)
+		return ep, err == nil, err
+	}
+	if cfg.Llm.ClaudeCommand != "" {
+		return ResolvedEndpoint{}, false, fmt.Errorf("llm.claude_command requires protocol %q", ProtocolClaudeCode)
 	}
 	// Fall through to later strategies when the legacy block is incomplete. This
 	// includes the case where neither auth_token nor auth_token_cmd is set — and,

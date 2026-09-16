@@ -35,6 +35,9 @@ const (
 	// official SDK's bedrock middleware performs that rewriting, so this
 	// shares the Anthropic client rather than reimplementing the protocol.
 	ProtocolAnthropicBedrock = "anthropic-bedrock"
+	// ProtocolClaudeCode runs the Claude Code CLI as a subprocess. The CLI owns
+	// authentication and model defaults; OCR does not configure an HTTP endpoint.
+	ProtocolClaudeCode = "claude-code"
 )
 
 // NormalizeProtocol canonicalizes protocol names. It is case-insensitive and
@@ -55,18 +58,53 @@ func NormalizeProtocol(raw string) string {
 		return ProtocolOpenAIResponses
 	case ProtocolAnthropicBedrock:
 		return ProtocolAnthropicBedrock
+	case ProtocolClaudeCode:
+		return ProtocolClaudeCode
 	default:
 		return normalized
 	}
 }
 
-// ValidateProtocol accepts the four canonical protocol names and rejects
-// everything else.
+// ValidateProtocol accepts the canonical protocol names and rejects everything else.
 func ValidateProtocol(p string) error {
 	switch p {
-	case ProtocolAnthropic, ProtocolOpenAIChatCompletions, ProtocolOpenAIResponses, ProtocolAnthropicBedrock:
+	case ProtocolAnthropic, ProtocolOpenAIChatCompletions, ProtocolOpenAIResponses, ProtocolAnthropicBedrock, ProtocolClaudeCode:
 		return nil
 	default:
-		return fmt.Errorf("unsupported protocol %q; supported protocols are %q, %q, %q, %q", p, ProtocolAnthropic, ProtocolOpenAIChatCompletions, ProtocolOpenAIResponses, ProtocolAnthropicBedrock)
+		return fmt.Errorf("unsupported protocol %q; supported protocols are %q, %q, %q, %q, %q", p, ProtocolAnthropic, ProtocolOpenAIChatCompletions, ProtocolOpenAIResponses, ProtocolAnthropicBedrock, ProtocolClaudeCode)
 	}
+}
+
+// ValidateClaudeCodeConfig rejects settings the subprocess transport cannot
+// honor. Errors name fields, never their values: an HTTP credential must not
+// leak while explaining that authentication belongs to the Claude CLI.
+func ValidateClaudeCodeConfig(cfg ClientConfig) error {
+	var unsupported []string
+	for _, field := range []struct {
+		name string
+		set  bool
+	}{
+		{"url", cfg.URL != ""},
+		{"api_key/auth_token", cfg.APIKey != ""},
+		{"auth_header", cfg.AuthHeader != ""},
+		{"extra_body", len(cfg.ExtraBody) > 0},
+		{"extra_headers", len(cfg.ExtraHeaders) > 0},
+		{"retry_codes", len(cfg.RetryCodes) > 0},
+		{"aws_profile", cfg.AWSProfile != ""},
+		{"aws_region", cfg.AWSRegion != ""},
+	} {
+		if field.set {
+			unsupported = append(unsupported, field.name)
+		}
+	}
+	if len(unsupported) > 0 {
+		return fmt.Errorf("claude-code does not support %s; configure authentication and transport in the Claude CLI instead", strings.Join(unsupported, ", "))
+	}
+	if cfg.ClaudeCommand != "" && (strings.TrimSpace(cfg.ClaudeCommand) == "" || strings.ContainsAny(cfg.ClaudeCommand, "\x00\r\n")) {
+		return fmt.Errorf("claude_command must be an executable name or path, not a shell command or a value containing control characters")
+	}
+	if cfg.Timeout < 0 {
+		return fmt.Errorf("claude-code timeout must be non-negative")
+	}
+	return nil
 }
