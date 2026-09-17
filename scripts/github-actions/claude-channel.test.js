@@ -21,7 +21,7 @@ const defaults = {
   effort: "low",
   review_concurrency: "1",
   llm_timeout: "300",
-  review_task_timeout: "15",
+  review_task_timeout: "30",
   max_tokens_budget: "500000",
 };
 

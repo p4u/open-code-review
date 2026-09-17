@@ -136,11 +136,56 @@ func TestClaudeCodeDiagnosticsRedactEveryParsePath(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeDiagnosticsResultMetrics(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		metrics map[string]any
+		want    string
+	}{
+		{"absent", nil, `Claude Code result "error_max_turns":`},
+		{"both", map[string]any{"num_turns": 4, "duration_api_ms": 1200}, `Claude Code result "error_max_turns" (num_turns=4, duration_api_ms=1200):`},
+		{"zero", map[string]any{"num_turns": 0, "duration_api_ms": 0}, `(num_turns=0, duration_api_ms=0):`},
+		{"turns only", map[string]any{"num_turns": 4}, `(num_turns=4):`},
+		{"duration only", map[string]any{"duration_api_ms": 1200}, `(duration_api_ms=1200):`},
+		{"negative", map[string]any{"num_turns": -1, "duration_api_ms": -1}, `Claude Code result "error_max_turns":`},
+		{"null", map[string]any{"num_turns": nil, "duration_api_ms": nil}, `Claude Code result "error_max_turns":`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("ANTHROPIC_AUTH_TOKEN", "fake-metrics-secret")
+			result := claudeCodeTestResult()
+			result["subtype"] = "error_max_turns"
+			result["errors"] = []string{"fake-metrics-secret\n::error::untrusted"}
+			for key, value := range tt.metrics {
+				result[key] = value
+			}
+			_, err := parseClaudeCodeResult(claudeCodeTestJSON(t, result), claudeCodeTestRequest(), "fixture", nil)
+			claudeCodeTestError(t, err, tt.want)
+			claudeCodeTestError(t, err, `[REDACTED]\n::error::untrusted`)
+			assertClaudeCodeSafeDiagnostic(t, err.Error())
+			if strings.Contains(err.Error(), "fake-metrics-secret") {
+				t.Fatal("numeric diagnostics bypassed credential redaction")
+			}
+		})
+	}
+	for _, field := range []string{"num_turns", "duration_api_ms"} {
+		t.Run("invalid "+field, func(t *testing.T) {
+			result := claudeCodeTestResult()
+			result["subtype"], result[field] = "error_max_turns", "untrusted nonnumeric value"
+			_, err := parseClaudeCodeResult(claudeCodeTestJSON(t, result), claudeCodeTestRequest(), "fixture", nil)
+			var cause *json.UnmarshalTypeError
+			if !errors.As(err, &cause) || strings.Contains(err.Error(), "untrusted nonnumeric value") {
+				t.Fatal("nonnumeric metrics were accepted or exposed")
+			}
+		})
+	}
+}
+
 func TestClaudeCodeDiagnosticsBoundCombinedFailure(t *testing.T) {
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "fake-combined-secret")
 	result := claudeCodeTestResult()
 	result["subtype"] = "error_max_turns"
 	result["errors"] = []string{"fake-combined-secret\n::error::untrusted\r\x1b[31m" + strings.Repeat("x", claudeCodeStderrLimit*2)}
+	result["num_turns"], result["duration_api_ms"] = 4, 1200
 	command, _ := newClaudeCodeTestCLI(t, claudeCodeHelperConfig{
 		Output: string(claudeCodeTestJSON(t, result)), ExitCode: 3,
 		Stderr: "fake-combined-secret\n::warning::untrusted" + strings.Repeat("x", claudeCodeStderrLimit),
@@ -148,6 +193,7 @@ func TestClaudeCodeDiagnosticsBoundCombinedFailure(t *testing.T) {
 	_, err := NewClaudeCodeClient(ClientConfig{ClaudeCommand: command}).CompletionsWithCtx(context.Background(), claudeCodeTestRequest())
 	claudeCodeTestError(t, err, `Claude Code result "error_max_turns"`)
 	claudeCodeTestError(t, err, "exit status 3")
+	claudeCodeTestError(t, err, "(num_turns=4, duration_api_ms=1200)")
 	claudeCodeTestError(t, err, `[REDACTED]\n::error::untrusted\r\x1b[31m`)
 	assertClaudeCodeSafeDiagnostic(t, err.Error())
 	if strings.Contains(err.Error(), "fake-combined-secret") || !strings.HasSuffix(err.Error(), " [truncated]") {

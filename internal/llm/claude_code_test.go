@@ -78,6 +78,21 @@ func TestClaudeCodeRequestSnapshot(t *testing.T) {
 	if !strings.HasPrefix(system, "Follow review rules.\n\nPreserve locations.\n\n") || !strings.Contains(system, claudeCodeActionPrompt) {
 		t.Fatalf("system prompt did not retain leading instructions and action contract: %q", system)
 	}
+	for _, instruction := range []string{
+		"Do not execute OCR functions or use native or MCP tools for review work",
+		"do not access the local filesystem yourself",
+		"Call the CLI's StructuredOutput tool solely to format the response envelope",
+		"Never include StructuredOutput in tool_calls",
+		"Batch independent context requests in the same tool_calls array",
+		"wait for OCR to return those results in the next snapshot rather than guessing them",
+	} {
+		if !strings.Contains(system, instruction) {
+			t.Fatalf("system prompt lost formatting or execution instruction %q", instruction)
+		}
+	}
+	if strings.Contains(system, "Never execute tools") || strings.Contains(string(input), "StructuredOutput") || strings.Contains(schema, "StructuredOutput") {
+		t.Fatal("CLI formatting was forbidden or exposed as an OCR function")
+	}
 	want := claudeCodeTestJSON(t, struct {
 		Messages []Message `json:"messages"`
 		Tools    []ToolDef `json:"tools"`
@@ -125,19 +140,28 @@ func TestClaudeCodeRequestToolChoice(t *testing.T) {
 				t.Fatal(err)
 			}
 			if choice == "none" {
-				if schema != "" || len(validators) != 0 || strings.Contains(string(input), `"tools"`) || !strings.Contains(system, "No tools are available") {
+				if schema != "" || len(validators) != 0 || strings.Contains(string(input), `"tools"`) || !strings.Contains(system, "No tools are available") || strings.Contains(system, "StructuredOutput") {
 					t.Fatal("tool_choice none still exposed tools or structured output")
 				}
 				return
 			}
-			if schema == "" || len(validators) != 1 {
-				t.Fatal("enabled tools lost their schema or validators")
+			if schema == "" || len(validators) != 1 || !strings.Contains(system, claudeCodeActionPrompt) {
+				t.Fatal("enabled tools lost their schema, validators, or formatting instruction")
 			}
 			if strings.Contains(schema, `"minItems":1`) != (choice == "required") {
 				t.Fatalf("schema does not implement tool_choice %q: %s", choice, schema)
 			}
 		})
 	}
+	t.Run("no available tools", func(t *testing.T) {
+		input, system, schema, validators, err := buildClaudeCodeRequest(claudeCodeTestRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if schema != "" || len(validators) != 0 || strings.Contains(string(input), `"tools"`) || strings.Contains(system, "StructuredOutput") || !strings.Contains(system, "No tools are available") {
+			t.Fatal("tool-free request exposed tools or a formatting instruction")
+		}
+	})
 	t.Run("nil parameters and omitted function type", func(t *testing.T) {
 		req := claudeCodeTestRequest()
 		req.Tools = []ToolDef{{Function: FunctionDef{Name: "finish"}}}

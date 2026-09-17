@@ -47,7 +47,7 @@ function fixture(fn) {
       GATEWAY_URL: "https://gateway.invalid",
       CLAUDE_VERSION: "2.1.273",
       LLM_TIMEOUT: "300",
-      REVIEW_TASK_TIMEOUT: "15",
+      REVIEW_TASK_TIMEOUT: "30",
     };
     fn(dir, env);
   } finally {
@@ -198,25 +198,27 @@ function testConfigurationAndModelSelection() {
 function testTimeoutInputsAndProgressForwarding() {
   const validation = step("Validate workflow configuration");
   const review = step("Review and publish findings");
-  for (const [name, expected] of [["llm_timeout", "300"], ["review_task_timeout", "15"]]) {
+  // Central reviews need a longer task window; keep the public Action's
+  // existing 15-minute default backward-compatible for other callers.
+  for (const [name, expected, actionDefault] of [["llm_timeout", "300", "300"], ["review_task_timeout", "30", "15"]]) {
     const definition = workflow.match(new RegExp(`^      ${name}:\\n([\\s\\S]*?)(?=^      [a-z_]+:)`, "m"));
     assert(definition, `${name} must be an explicit reusable-workflow input`);
     assert.match(definition[1], /^        type: string$/m);
     assert.match(definition[1], new RegExp(`^        default: '${expected}'$`, "m"));
     const actionDefinition = action.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  [a-z_]+:)`, "m"));
     assert(actionDefinition, `the composite Action must accept ${name}`);
-    assert.match(actionDefinition[1], new RegExp(`^    default: '${expected}'$`, "m"), `${name} defaults must match the Action`);
+    assert.match(actionDefinition[1], new RegExp(`^    default: '${actionDefault}'$`, "m"), `${name} must preserve the Action's existing default`);
     assert(validation.includes(`${name.toUpperCase()}: \${{ inputs.${name} }}`), `${name} must be validated through env`);
     assert(review.includes(`${name}: \${{ steps.settings.outputs.${name} }}`), `${name} must forward the validated value`);
   }
   assert(review.includes("stream_progress: 'true'"), "the worker must stream provider failures into the console and stderr artifact");
   assert(review.includes("upload_artifacts: 'true'"));
-  assert(workflow.includes("timeout-minutes: 30"), "the job deadline must stay unchanged");
+  assert.match(workflow, /^    timeout-minutes: 60$/m, "the finite job deadline must allow a 30-minute task plus other groups and setup");
   assert(review.includes("API_TIMEOUT_MS: '30000'"), "the gateway HTTP timeout must stay separate from OCR deadlines");
 }
 
 function testTimeoutConfigurationAcceptsBoundariesAndNormalizes() {
-  for (const [llm, task] of [["1", "1"], ["300", "15"], ["900", "30"], ["7200", "120"], ["000900", "0010"]]) {
+  for (const [llm, task] of [["1", "1"], ["300", "30"], ["300", "15"], ["900", "30"], ["7200", "120"], ["000900", "0010"]]) {
     fixture((dir, env) => {
       const result = run("Validate workflow configuration", { ...env, LLM_TIMEOUT: llm, REVIEW_TASK_TIMEOUT: task });
       assert.strictEqual(result.status, 0, result.stderr);
