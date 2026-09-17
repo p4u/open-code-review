@@ -892,6 +892,59 @@ function testRunStreamsProgressWhenOptedIn() {
   }
 }
 
+function testCLIProviderErrorProgressReachesConsoleAndArtifact() {
+  const fixture = makeFixture();
+  try {
+    const values = inputValues({
+      provider: "claude-code",
+      llm_model: "fixture-model",
+      llm_timeout: "900",
+      review_task_timeout: "30",
+      stream_progress: "true",
+    });
+    const validated = runStep(validationStep(), values, fixture);
+    assert.strictEqual(validated.status, 0, resultDescription(validated));
+    const validatedEnv = readEnvAssignments(path.join(fixture.dir, "github-env"));
+    assert.strictEqual(validatedEnv.STREAM_PROGRESS, "true");
+    const configured = runStep(stepNamed("Configure OCR"), values, fixture, validatedEnv);
+    assert.strictEqual(configured.status, 0, resultDescription(configured));
+    const home = readEnvAssignments(path.join(fixture.dir, "github-output")).home;
+    const outputs = initializeReviewOutputs(fixture);
+    // Fake OCR supplies an already-sanitized provider error. This executes the
+    // Action's routing/artifact boundary, not the Go backend's sanitization.
+    const progress = "[ocr] main.go: LLM request failed: claude-code result error: rate_limit_error: gateway quota exceeded (credential=[REDACTED])\n";
+    const result = runStep(stepNamed("Run OpenCodeReview"), values, fixture, {
+      ...validatedEnv,
+      OCR_ACTION_HOME: home,
+      MERGE_BASE: "base-sha",
+      HEAD_SHA: "head-sha",
+      OCR_FAKE_REVIEW_STDERR: progress,
+      OCR_FAKE_REVIEW_STATUS: "7",
+    }, { stepOutputs: { review_files: outputs } });
+    assert.strictEqual(result.status, 0, "the Action must preserve artifacts before its separate failure step");
+    assert.strictEqual(result.stderr, progress, "safe provider-error progress must stream to console stderr");
+    assert.strictEqual(fs.readFileSync(outputs.stderr_path, "utf8"), progress, "the artifact must retain the same provider diagnosis");
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(outputs.result_path, "utf8")), { comments: [], warnings: [] }, "progress must not corrupt result JSON");
+    assert.ok(!fs.existsSync(path.join(outputs.directory, "stderr.fifo")), "tee must finish and remove its FIFO before upload");
+    const review = readJsonLines(fixture.callsPath).find((call) => call.args[0] === "review");
+    assert.ok(review);
+    assert.strictEqual(review.args[review.args.indexOf("--provider") + 1], "claude-code");
+    assert.ok(!review.args.includes("--audience"), "progress requires human-audience stderr routing");
+    assert.strictEqual(review.env.OCR_LLM_TIMEOUT, "900");
+    assert.strictEqual(review.args[review.args.indexOf("--timeout") + 1], "30");
+    const reviewOutputs = readEnvAssignments(path.join(fixture.dir, "github-output"));
+    assert.strictEqual(artifactUploadAllowed(values, { outcome: "success", outputs }, { outputs: reviewOutputs }), true);
+    const paths = stepNamed("Upload review artifacts").raw.match(/        path: \|\n((?:          .+\n)+)/)[1];
+    assert.deepStrictEqual(resolveInputExpressions(paths, values, { review_files: outputs }).trim().split(/\n\s*/), [outputs.result_path, outputs.stderr_path]);
+    const exported = readEnvAssignments(path.join(fixture.dir, "github-env"));
+    assert.strictEqual(exported.OCR_EXIT_CODE, "7", "tee must not overwrite the provider failure status");
+    const failed = runStep(stepNamed("Fail job on OCR error"), values, fixture, exported);
+    assert.strictEqual(failed.status, 7, "provider failures must still fail the job after artifact upload");
+  } finally {
+    removeFixture(fixture);
+  }
+}
+
 function testLlmExtraBodyDefaultDisablesThinking() {
   assert.ok(INPUTS.llm_extra_body, "action.yml must define the llm_extra_body input");
   assert.strictEqual(
@@ -2214,6 +2267,7 @@ const TESTS = [
   ["stream_progress validation accepts true/false case-insensitively", testValidateInputsValidatesStreamProgress],
   ["Run OpenCodeReview keeps --audience agent and the log file by default", testRunKeepsAgentAudienceAndLogFileByDefault],
   ["Run OpenCodeReview streams live progress when opted in", testRunStreamsProgressWhenOptedIn],
+  ["already-sanitized CLI provider-error progress reaches console stderr and artifact files", testCLIProviderErrorProgressReachesConsoleAndArtifact],
   ["llm_extra_body defaults to disabling thinking", testLlmExtraBodyDefaultDisablesThinking],
   ["Configure OCR merges reasoning_effort into extra_body", testConfigureMergesReasoningEffortIntoExtraBody],
   ["Configure OCR rejects reasoning_effort on the anthropic protocol", testConfigureRejectsReasoningEffortOnAnthropic],

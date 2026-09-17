@@ -14,6 +14,7 @@ const { spawnSync } = require("child_process");
 const root = path.resolve(__dirname, "../..");
 const workflow = fs.readFileSync(path.join(root, ".github/workflows/claude-review.yml"), "utf8");
 const example = fs.readFileSync(path.join(root, "examples/github_actions/claude-code.yml"), "utf8");
+const action = fs.readFileSync(path.join(root, "action.yml"), "utf8");
 
 function step(name) {
   const marker = `      - name: ${name}\n`;
@@ -45,6 +46,8 @@ function fixture(fn) {
       MODEL: "claude-gpt-6-astra",
       GATEWAY_URL: "https://gateway.invalid",
       CLAUDE_VERSION: "2.1.273",
+      LLM_TIMEOUT: "300",
+      REVIEW_TASK_TIMEOUT: "15",
     };
     fn(dir, env);
   } finally {
@@ -189,6 +192,58 @@ function testConfigurationAndModelSelection() {
       assert(output.includes(`source_sha=${"a".repeat(40)}\n`));
       assert(!fs.existsSync(path.join(dir, "injected")));
     });
+  }
+}
+
+function testTimeoutInputsAndProgressForwarding() {
+  const validation = step("Validate workflow configuration");
+  const review = step("Review and publish findings");
+  for (const [name, expected] of [["llm_timeout", "300"], ["review_task_timeout", "15"]]) {
+    const definition = workflow.match(new RegExp(`^      ${name}:\\n([\\s\\S]*?)(?=^      [a-z_]+:)`, "m"));
+    assert(definition, `${name} must be an explicit reusable-workflow input`);
+    assert.match(definition[1], /^        type: string$/m);
+    assert.match(definition[1], new RegExp(`^        default: '${expected}'$`, "m"));
+    const actionDefinition = action.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  [a-z_]+:)`, "m"));
+    assert(actionDefinition, `the composite Action must accept ${name}`);
+    assert.match(actionDefinition[1], new RegExp(`^    default: '${expected}'$`, "m"), `${name} defaults must match the Action`);
+    assert(validation.includes(`${name.toUpperCase()}: \${{ inputs.${name} }}`), `${name} must be validated through env`);
+    assert(review.includes(`${name}: \${{ steps.settings.outputs.${name} }}`), `${name} must forward the validated value`);
+  }
+  assert(review.includes("stream_progress: 'true'"), "the worker must stream provider failures into the console and stderr artifact");
+  assert(review.includes("upload_artifacts: 'true'"));
+  assert(workflow.includes("timeout-minutes: 30"), "the job deadline must stay unchanged");
+  assert(review.includes("API_TIMEOUT_MS: '30000'"), "the gateway HTTP timeout must stay separate from OCR deadlines");
+}
+
+function testTimeoutConfigurationAcceptsBoundariesAndNormalizes() {
+  for (const [llm, task] of [["1", "1"], ["300", "15"], ["900", "30"], ["7200", "120"], ["000900", "0010"]]) {
+    fixture((dir, env) => {
+      const result = run("Validate workflow configuration", { ...env, LLM_TIMEOUT: llm, REVIEW_TASK_TIMEOUT: task });
+      assert.strictEqual(result.status, 0, result.stderr);
+      const output = fs.readFileSync(env.GITHUB_OUTPUT, "utf8");
+      assert(output.includes(`llm_timeout=${Number(llm)}\n`));
+      assert(output.includes(`review_task_timeout=${Number(task)}\n`));
+    });
+  }
+}
+
+function testTimeoutConfigurationRejectsInvalidValues() {
+  for (const [name, maximum] of [["LLM_TIMEOUT", 7200], ["REVIEW_TASK_TIMEOUT", 120]]) {
+    const values = [
+      "", "0", "-1", "+1", "1.5", "1e2", "0x10", "Infinity", String(maximum + 1), "9".repeat(400),
+      " 1", "1 ", "1\nINJECTED=value", "1\r", "1\t", "30s", "$(touch injected)", "fixture-timeout-secret",
+    ];
+    for (const value of values) {
+      fixture((dir, env) => {
+        const result = run("Validate workflow configuration", { ...env, [name]: value });
+        assert.strictEqual(result.status, 1, `${name}=${JSON.stringify(value)}: ${result.stderr}`);
+        assert(result.stderr.includes(name.toLowerCase()), "diagnostics must identify the invalid timeout");
+        assert(!result.stderr.includes("fixture-timeout-secret"), "diagnostics must not echo invalid values");
+        assert.strictEqual(result.stdout, "");
+        assert(!fs.existsSync(env.GITHUB_OUTPUT), "invalid timeouts must not publish step outputs");
+        assert(!fs.existsSync(path.join(dir, "injected")));
+      });
+    }
   }
 }
 
@@ -356,6 +411,9 @@ const tests = [
   testRunnerHomeRejectsInvalidTempRoots,
   testRunnerHomeFailsClosedWhenTempCreationFails,
   testConfigurationAndModelSelection,
+  testTimeoutInputsAndProgressForwarding,
+  testTimeoutConfigurationAcceptsBoundariesAndNormalizes,
+  testTimeoutConfigurationRejectsInvalidValues,
   testInvalidConfigurationFailsBeforeCheckout,
   testTrustedBootstrapAndCredentialScope,
   testRunnerSelectionAndBootstrap,

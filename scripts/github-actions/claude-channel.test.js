@@ -20,6 +20,8 @@ const defaults = {
   claude_version: "2.1.273",
   effort: "low",
   review_concurrency: "1",
+  llm_timeout: "300",
+  review_task_timeout: "15",
   max_tokens_budget: "500000",
 };
 

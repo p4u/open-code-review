@@ -504,7 +504,7 @@ func TestClaudeCodeErrorRedaction(t *testing.T) {
 		t.Fatal("redacted a non-sensitive value")
 	}
 	got := redactClaudeCodeError(strings.Repeat("x", claudeCodeStderrLimit+1))
-	if got != strings.Repeat("x", claudeCodeStderrLimit)+" [truncated]" {
+	if got != strings.Repeat("x", claudeCodeStderrLimit-len(" [truncated]"))+" [truncated]" {
 		t.Fatal("diagnostic output was not bounded")
 	}
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "fake-result-secret")

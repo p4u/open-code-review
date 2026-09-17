@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -55,11 +56,12 @@ func NewClaudeCodeClient(cfg ClientConfig) *ClaudeCodeClient {
 // CompletionsWithCtx translates proposed actions into OCR tool calls, never
 // forwarding already-executed Claude Code tool events into the OCR runner.
 func (c *ClaudeCodeClient) CompletionsWithCtx(ctx context.Context, req ChatRequest) (resp *ChatResponse, err error) {
+	defer func() { err = presentClaudeCodeError(err) }()
 	if err := ValidateClaudeCodeConfig(c.cfg); err != nil {
 		return nil, err
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	if ctx.Err() != nil {
+		return nil, claudeCodeParentContextError(ctx, c.cfg.Timeout)
 	}
 	input, system, schema, validators, err := buildClaudeCodeRequest(req)
 	if err != nil {
@@ -107,7 +109,10 @@ func (c *ClaudeCodeClient) CompletionsWithCtx(ctx context.Context, req ChatReque
 	} else {
 		args = append(args, "--max-turns", "1")
 	}
-	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+	// A distinct cause identifies which deadline fired first, even if the parent
+	// also expires while the subprocess is being reaped.
+	requestTimeout := fmt.Errorf("Claude Code request timeout (configured limit %s): %w", c.cfg.Timeout, context.DeadlineExceeded)
+	ctx, cancel := context.WithTimeoutCause(ctx, c.cfg.Timeout, requestTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = dir
@@ -124,21 +129,40 @@ func (c *ClaudeCodeClient) CompletionsWithCtx(ctx context.Context, req ChatReque
 	}()
 	runErr := cmd.Run()
 	cleanupClaudeCodeProcess(cmd)
-	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("Claude Code completion: %w", err)
+	if ctx.Err() != nil {
+		contextErr := requestTimeout
+		if context.Cause(ctx) != requestTimeout {
+			contextErr = claudeCodeParentContextError(ctx, c.cfg.Timeout)
+		}
+		if runErr != nil {
+			contextErr = fmt.Errorf("%w; Claude Code process: %w", contextErr, runErr)
+		}
+		return nil, contextErr
 	}
 	if stdout.overflow {
-		return nil, fmt.Errorf("Claude Code output exceeds %d bytes", claudeCodeOutputLimit)
+		overflowErr := fmt.Errorf("Claude Code output exceeds %d bytes", claudeCodeOutputLimit)
+		if runErr != nil {
+			overflowErr = fmt.Errorf("%w; Claude Code process: %w", overflowErr, runErr)
+		}
+		return nil, overflowErr
 	}
 	// In-run failures are structured results on stdout, including auth errors.
-	// Prefer them over the less useful "exit status 1" when available.
+	// Retain both the process status and the more useful result error, including
+	// their causes. The completion boundary sanitizes the entire diagnostic.
 	resp, resultErr := parseClaudeCodeResult(stdout.Bytes(), req, model, validators)
 	if runErr != nil {
-		detail := redactClaudeCodeError(stderr.String())
+		failure := fmt.Errorf("Claude Code failed: %w", runErr)
 		if resultErr != nil && len(stdout.Bytes()) > 0 {
-			detail = resultErr.Error() + "; " + detail
+			failure = fmt.Errorf("%w; %w", failure, resultErr)
 		}
-		return nil, fmt.Errorf("Claude Code failed: %w: %s", runErr, strings.TrimSpace(detail))
+		if stderr.overflow {
+			// A credential cut at the capture boundary cannot be safely matched
+			// against its full value. Do not expose any of the partial stderr.
+			failure = fmt.Errorf("%w; stderr omitted: exceeds %d-byte capture limit", failure, claudeCodeStderrLimit)
+		} else if detail := strings.TrimSpace(stderr.String()); detail != "" {
+			failure = fmt.Errorf("%w; stderr: %s", failure, detail)
+		}
+		return nil, failure
 	}
 	if resultErr != nil {
 		return nil, resultErr
@@ -272,14 +296,15 @@ type claudeCodeResult struct {
 	ModelUsage map[string]json.RawMessage `json:"modelUsage"`
 }
 
-func parseClaudeCodeResult(data []byte, req ChatRequest, model string, validators map[string]*jsonschema.Resolved) (*ChatResponse, error) {
+func parseClaudeCodeResult(data []byte, req ChatRequest, model string, validators map[string]*jsonschema.Resolved) (resp *ChatResponse, err error) {
+	defer func() { err = presentClaudeCodeError(err) }()
 	var result claudeCodeResult
 	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, fmt.Errorf("decode Claude Code JSON result: %w", err)
 	}
 	if result.Type != "result" || result.Subtype != "success" || result.IsError {
 		detail := strings.Join(append(result.Errors, result.Result), "; ")
-		return nil, fmt.Errorf("Claude Code result %q: %s", result.Subtype, redactClaudeCodeError(detail))
+		return nil, fmt.Errorf("Claude Code result %q: %s", result.Subtype, detail)
 	}
 	if result.StopReason == "max_tokens" || result.StopReason == "refusal" {
 		return nil, fmt.Errorf("Claude Code stopped with %s", result.StopReason)
@@ -312,11 +337,14 @@ func parseClaudeCodeResult(data []byte, req ChatRequest, model string, validator
 				return nil, fmt.Errorf("Claude Code requested unknown function %q", call.Name)
 			}
 			var arguments map[string]any
-			if err := json.Unmarshal(call.Arguments, &arguments); err != nil || arguments == nil {
+			if err := json.Unmarshal(call.Arguments, &arguments); err != nil {
+				return nil, fmt.Errorf("Claude Code function %q requires a JSON argument object: %w", call.Name, err)
+			}
+			if arguments == nil {
 				return nil, fmt.Errorf("Claude Code function %q requires a JSON argument object", call.Name)
 			}
 			if err := validator.Validate(arguments); err != nil {
-				return nil, fmt.Errorf("Claude Code function %q has invalid arguments: %s", call.Name, redactClaudeCodeError(err.Error()))
+				return nil, fmt.Errorf("Claude Code function %q has invalid arguments: %w", call.Name, err)
 			}
 			calls = append(calls, ToolCall{
 				ID: "call_" + uuid.NewString(), Type: "function",
@@ -378,22 +406,78 @@ func claudeCodeEnvironment(maxTokens int) []string {
 	return env
 }
 
+func claudeCodeParentContextError(ctx context.Context, limit time.Duration) error {
+	err := ctx.Err()
+	if cause := context.Cause(ctx); cause != err {
+		err = fmt.Errorf("%w: %w", err, cause)
+	}
+	return fmt.Errorf("Claude Code parent context ended (configured request limit %s): %w", limit, err)
+}
+
+// claudeCodeDiagnostic changes presentation only: callers can still inspect the
+// original parser, process, and context errors with errors.Is and errors.As.
+// Never log the unwrapped cause, which may contain untrusted output or secrets.
+type claudeCodeDiagnostic struct {
+	message string
+	cause   error
+}
+
+func (e *claudeCodeDiagnostic) Error() string { return e.message }
+func (e *claudeCodeDiagnostic) Unwrap() error { return e.cause }
+
+func presentClaudeCodeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := err.(*claudeCodeDiagnostic); ok {
+		return err
+	}
+	return &claudeCodeDiagnostic{message: redactClaudeCodeError(err.Error()), cause: err}
+}
+
 func redactClaudeCodeSecrets(detail string) string {
+	var secrets []string
 	for _, entry := range os.Environ() {
 		name, value, _ := strings.Cut(entry, "=")
 		if len(value) >= 8 && sensitiveHeader(name) {
-			detail = strings.ReplaceAll(detail, value, "[REDACTED]")
+			// Parser diagnostics quote names, and captured results use JSON. Match
+			// those escaped spellings too, before escaping controls or truncating.
+			quoted := strconv.Quote(value)
+			encoded, _ := json.Marshal(value)
+			secrets = append(secrets, value, quoted[1:len(quoted)-1], string(encoded[1:len(encoded)-1]))
 		}
+	}
+	// A shorter overlapping credential must not leave the longer one's suffix.
+	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+	for _, secret := range secrets {
+		detail = strings.ReplaceAll(detail, secret, "[REDACTED]")
 	}
 	return detail
 }
 
 func redactClaudeCodeError(detail string) string {
+	const truncated = " [truncated]"
 	detail = redactClaudeCodeSecrets(detail)
-	if len(detail) > claudeCodeStderrLimit {
-		detail = detail[:claudeCodeStderrLimit] + " [truncated]"
+	var safe strings.Builder
+	truncateAt := 0
+	for _, r := range detail {
+		text := string(r)
+		if !strconv.IsPrint(r) {
+			quoted := strconv.QuoteRune(r)
+			text = quoted[1 : len(quoted)-1]
+		}
+		// Bound the escaped presentation, not just its input; never split UTF-8
+		// or an escape sequence. Newlines and terminal controls stay literal so
+		// model output cannot introduce another line of workflow log commands.
+		if safe.Len()+len(text) > claudeCodeStderrLimit {
+			return safe.String()[:truncateAt] + truncated
+		}
+		safe.WriteString(text)
+		if safe.Len() <= claudeCodeStderrLimit-len(truncated) {
+			truncateAt = safe.Len()
+		}
 	}
-	return detail
+	return safe.String()
 }
 
 func (c *ClaudeCodeClient) captureClaudeCode(ctx context.Context, started time.Time, model, system string, input, output []byte, err error) {

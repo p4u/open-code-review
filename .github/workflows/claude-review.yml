@@ -35,6 +35,14 @@ on:
         description: Maximum parallel OCR review tasks within this run.
         type: string
         default: '1'
+      llm_timeout:
+        description: Per-request LLM timeout in integer seconds, from 1 through 7200.
+        type: string
+        default: '300'
+      review_task_timeout:
+        description: Per-file/concurrent-task timeout in integer minutes, from 1 through 120; the job deadline still applies.
+        type: string
+        default: '15'
       max_tokens_budget:
         description: Total review token cap; an incomplete budget-limited review fails the check.
         type: string
@@ -97,6 +105,8 @@ jobs:
           MODEL: ${{ inputs.model || vars.OCR_MODEL || 'claude-gpt-6-astra' }}
           GATEWAY_URL: ${{ inputs.gateway_url || vars.OCR_GATEWAY_URL }}
           CLAUDE_VERSION: ${{ inputs.claude_version }}
+          LLM_TIMEOUT: ${{ inputs.llm_timeout }}
+          REVIEW_TASK_TIMEOUT: ${{ inputs.review_task_timeout }}
         run: |
           node <<'NODE'
           const fs = require('fs');
@@ -106,6 +116,8 @@ jobs:
             model: process.env.MODEL,
             gateway_url: process.env.GATEWAY_URL,
             claude_version: process.env.CLAUDE_VERSION,
+            llm_timeout: process.env.LLM_TIMEOUT,
+            review_task_timeout: process.env.REVIEW_TASK_TIMEOUT,
           };
           function fail(message) { console.error(message); process.exit(1); }
           for (const [name, value] of Object.entries(values)) {
@@ -122,6 +134,16 @@ jobs:
           values.source_sha = values.source_sha.toLowerCase();
           if (!/^\d+\.\d+\.\d+$/.test(values.claude_version)) {
             fail('claude_version must be an exact release version');
+          }
+          for (const [name, maximum, unit] of [
+            ['llm_timeout', 7200, 'seconds'],
+            ['review_task_timeout', 120, 'minutes'],
+          ]) {
+            const timeout = Number(values[name]);
+            if (!/^[0-9]+$/.test(values[name]) || !Number.isInteger(timeout) || timeout < 1 || timeout > maximum) {
+              fail(`${name} must be a base-10 integer from 1 through ${maximum} ${unit}`);
+            }
+            values[name] = String(timeout);
           }
           let gateway;
           try { gateway = new URL(values.gateway_url); } catch { fail('gateway_url must be an HTTPS URL'); }
@@ -203,7 +225,10 @@ jobs:
           github_token: ${{ github.token }}
           effort: ${{ inputs.effort }}
           review_concurrency: ${{ inputs.review_concurrency }}
+          llm_timeout: ${{ steps.settings.outputs.llm_timeout }}
+          review_task_timeout: ${{ steps.settings.outputs.review_task_timeout }}
           max_tokens_budget: ${{ inputs.max_tokens_budget }}
+          stream_progress: 'true'
           sticky_summary: 'true'
           incremental: 'true'
           checkpoint_range: 'false'
