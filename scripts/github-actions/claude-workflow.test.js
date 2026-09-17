@@ -122,8 +122,7 @@ function testTrustedBootstrapAndCredentialScope() {
   assert(workflow.includes("github.event.pull_request.head.repo.full_name == github.repository"));
   assert(workflow.includes("github.event.pull_request.user.type != 'Bot'"));
   assert(workflow.includes("!github.event.pull_request.draft"));
-  assert(workflow.includes("runs-on: ubuntu-latest"));
-  assert(!workflow.includes("self-hosted"));
+  assert(workflow.includes("runs-on: ${{ fromJSON(inputs.runner_labels) }}"));
   assert(workflow.includes("contents: read\n  pull-requests: write"));
   assert(!workflow.includes("contents: write"));
   const base = step("Checkout trusted review base");
@@ -153,6 +152,23 @@ function testTrustedBootstrapAndCredentialScope() {
   const uses = [...workflow.matchAll(/uses: (actions\/[^\s]+)/g)].map((match) => match[1]);
   assert(uses.length >= 4);
   for (const action of uses) assert(/@[a-f0-9]{40}$/.test(action), `unpinned action: ${action}`);
+}
+
+function testRunnerSelectionAndBootstrap() {
+  const input = workflow.match(/^      runner_labels:\n([\s\S]*?)(?=^      [a-z_]+:)/m);
+  assert(input, "runner labels must be an explicit reusable-workflow input");
+  assert(input[1].includes("type: string"));
+  const defaultLabels = input[1].match(/default: '(\[[^\n]+\])'/);
+  assert(defaultLabels);
+  assert.deepStrictEqual(JSON.parse(defaultLabels[1]), ["ubuntu-latest"], "existing callers keep the hosted default");
+  assert(workflow.includes("runs-on: ${{ fromJSON(inputs.runner_labels) }}"));
+  const node = step("Set up Node.js");
+  assert(node.includes("node-version: '24'"));
+  assert(node.includes("package-manager-cache: false"));
+  const setup = workflow.indexOf("name: Set up Node.js");
+  assert(setup < workflow.indexOf("name: Validate workflow configuration"), "self-hosted runners need Node before the validation script");
+  assert(setup < workflow.indexOf("name: Checkout trusted review base"));
+  assert.strictEqual(workflow.split("name: Set up Node.js").length - 1, 1);
 }
 
 function testBuildChecksPinnedRevision() {
@@ -224,6 +240,7 @@ const tests = [
   testConfigurationAndModelSelection,
   testInvalidConfigurationFailsBeforeCheckout,
   testTrustedBootstrapAndCredentialScope,
+  testRunnerSelectionAndBootstrap,
   testBuildChecksPinnedRevision,
   testPinnedClaudeInstallation,
   testPublicationMustSucceed,

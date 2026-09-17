@@ -259,7 +259,9 @@ if (args[0] === "config" && args[1] === "set") {
   if (output && !output.endsWith("\\n")) process.stdout.write("\\n");
   process.exit(Number(process.env.OCR_FAKE_VERSION_STATUS || 0));
 } else if (args[0] === "review") {
-  process.stdout.write(JSON.stringify({ comments: [], warnings: [] }));
+  process.stdout.write(JSON.stringify({ comments: [], warnings: [], message: process.env.OCR_FAKE_REVIEW_MESSAGE }));
+  process.stderr.write(process.env.OCR_FAKE_REVIEW_STDERR || "");
+  process.exit(Number(process.env.OCR_FAKE_REVIEW_STATUS || 0));
 } else {
   process.stdout.write("ocr " + args.join(" ") + "\\n");
 }
@@ -306,14 +308,25 @@ function runShell(script, env, fixture) {
   return result;
 }
 
+function initializeReviewOutputs(fixture, extraEnv = {}) {
+  fixture.initializationCount = (fixture.initializationCount || 0) + 1;
+  const outputFile = path.join(fixture.dir, `review-files-${fixture.initializationCount}.out`);
+  const result = runShell(stepNamed("Initialize review outputs").run, {
+    ...extraEnv, GITHUB_OUTPUT: outputFile,
+  }, fixture);
+  assert.strictEqual(result.status, 0, resultDescription(result));
+  const outputs = readEnvAssignments(outputFile);
+  fixture.resultPath = outputs.result_path;
+  fixture.stderrPath = outputs.stderr_path;
+  return outputs;
+}
+
 function runStep(step, values, fixture, extraEnv = {}, options = {}) {
-  let script = renderedRun(step, values);
-  if (options.replaceResultPaths) {
-    script = script
-      .replaceAll("/tmp/ocr-result.json", fixture.resultPath)
-      .replaceAll("/tmp/ocr-stderr.log", fixture.stderrPath);
+  const stepOutputs = { ...options.stepOutputs };
+  if (options.initializeReviewOutputs) {
+    stepOutputs.review_files = initializeReviewOutputs(fixture);
   }
-  return runShell(script, Object.assign({}, renderedEnv(step, values), extraEnv), fixture);
+  return runShell(renderedRun(step, values), Object.assign({}, renderedEnv(step, values, stepOutputs), extraEnv), fixture);
 }
 
 function resultDescription(result) {
@@ -464,7 +477,7 @@ function testReviewTimeoutForwardedSeparatelyFromLlmTimeout() {
       values,
       fixture,
       { MERGE_BASE: "base-sha", HEAD_SHA: "head-sha", REVIEW_TASK_TIMEOUT: values.review_task_timeout },
-      { replaceResultPaths: true }
+      { initializeReviewOutputs: true }
     );
     assert.strictEqual(result.status, 0, `Run OpenCodeReview shell block failed; ${resultDescription(result)}`);
     const reviewCall = readJsonLines(fixture.callsPath).find((call) => call.args[0] === "review");
@@ -506,7 +519,7 @@ function testDefaultLlmTimeoutExportedSeparatelyFromReviewTimeout() {
       values,
       fixture,
       { MERGE_BASE: "base-sha", HEAD_SHA: "head-sha", REVIEW_TASK_TIMEOUT: values.review_task_timeout },
-      { replaceResultPaths: true }
+      { initializeReviewOutputs: true }
     );
     assert.strictEqual(result.status, 0, `Run OpenCodeReview shell block failed; ${resultDescription(result)}`);
     const reviewCall = readJsonLines(fixture.callsPath).find((call) => call.args[0] === "review");
@@ -539,7 +552,7 @@ function testEmptyLlmTimeoutNormalizesBeforeReviewInvocation() {
       values,
       fixture,
       { MERGE_BASE: "base-sha", HEAD_SHA: "head-sha", REVIEW_TASK_TIMEOUT: values.review_task_timeout },
-      { replaceResultPaths: true }
+      { initializeReviewOutputs: true }
     );
     assert.strictEqual(result.status, 0, `Run OpenCodeReview shell block failed; ${resultDescription(result)}`);
     const reviewCall = readJsonLines(fixture.callsPath).find((call) => call.args[0] === "review");
@@ -584,7 +597,7 @@ function testReviewTimeoutLeadingZeroIsNormalizedAcrossSteps() {
       values,
       fixture,
       { MERGE_BASE: "base-sha", HEAD_SHA: "head-sha", REVIEW_TASK_TIMEOUT: exported.REVIEW_TASK_TIMEOUT },
-      { replaceResultPaths: true }
+      { initializeReviewOutputs: true }
     );
     assert.strictEqual(result.status, 0, `Run OpenCodeReview shell block failed; ${resultDescription(result)}`);
     const reviewCall = readJsonLines(fixture.callsPath).find((call) => call.args[0] === "review");
@@ -661,7 +674,7 @@ function testEffortAndBudgetNormalizeAndForwardAcrossSteps() {
         EFFORT: exported.EFFORT,
         MAX_TOKENS_BUDGET: exported.MAX_TOKENS_BUDGET,
       },
-      { replaceResultPaths: true }
+      { initializeReviewOutputs: true }
     );
     assert.strictEqual(result.status, 0, `Run OpenCodeReview shell block failed; ${resultDescription(result)}`);
     const reviewCall = readJsonLines(fixture.callsPath).find((call) => call.args[0] === "review");
@@ -713,7 +726,7 @@ function testEmptyEffortAndBudgetOmitTheFlags() {
         EFFORT: "",
         MAX_TOKENS_BUDGET: "",
       },
-      { replaceResultPaths: true }
+      { initializeReviewOutputs: true }
     );
     assert.strictEqual(result.status, 0, `Run OpenCodeReview shell block failed; ${resultDescription(result)}`);
     const reviewCall = readJsonLines(fixture.callsPath).find((call) => call.args[0] === "review");
@@ -821,7 +834,7 @@ function testRunKeepsAgentAudienceAndLogFileByDefault() {
   assert.ok(run, "action.yml must retain the Run OpenCodeReview step");
   assert.match(
     run.run,
-    /STREAM_PROGRESS:-false\}" = "true" \]; then\s+OCR_STDERR_FIFO="\$\(mktemp -u\)"\s+mkfifo "\$OCR_STDERR_FIFO" \|\| exit 1\s+tee \/tmp\/ocr-stderr\.log < "\$OCR_STDERR_FIFO" >&2 &\s+TEE_PID=\$!\s+"\$OCR_EXECUTABLE" review "\$\{ARGS\[@\]\}" > \/tmp\/ocr-result\.json 2> "\$OCR_STDERR_FIFO"\s+OCR_EXIT_CODE=\$\?\s+wait "\$TEE_PID"\s+rm -f "\$OCR_STDERR_FIFO"\s+else\s+"\$OCR_EXECUTABLE" review "\$\{ARGS\[@\]\}" > \/tmp\/ocr-result\.json 2>\/tmp\/ocr-stderr\.log/,
+    /STREAM_PROGRESS:-false\}" = "true" \]; then\s+OCR_STDERR_FIFO="\$OCR_OUTPUT_DIR\/stderr\.fifo"\s+mkfifo "\$OCR_STDERR_FIFO" \|\| exit 1\s+tee "\$OCR_STDERR_PATH" < "\$OCR_STDERR_FIFO" >&2 &\s+TEE_PID=\$!\s+echo "started=true" >> "\$GITHUB_OUTPUT"\s+"\$OCR_EXECUTABLE" review "\$\{ARGS\[@\]\}" > "\$OCR_RESULT_PATH" 2> "\$OCR_STDERR_FIFO"\s+OCR_EXIT_CODE=\$\?\s+wait "\$TEE_PID"\s+rm -f "\$OCR_STDERR_FIFO"\s+else\s+echo "started=true" >> "\$GITHUB_OUTPUT"\s+"\$OCR_EXECUTABLE" review "\$\{ARGS\[@\]\}" > "\$OCR_RESULT_PATH" 2> "\$OCR_STDERR_PATH"/,
     "the live-tee path must be gated on stream_progress, flush the FIFO-fed tee via wait, and the default path must redirect stderr to the log file"
   );
   const fixture = makeFixture();
@@ -837,7 +850,7 @@ function testRunKeepsAgentAudienceAndLogFileByDefault() {
       values,
       fixture,
       { MERGE_BASE: "base-sha", HEAD_SHA: "head-sha", REVIEW_TASK_TIMEOUT: "15" },
-      { replaceResultPaths: true }
+      { initializeReviewOutputs: true }
     );
     assert.strictEqual(result.status, 0, `Run OpenCodeReview shell block failed; ${resultDescription(result)}`);
     const reviewCall = readJsonLines(fixture.callsPath).find((call) => call.args[0] === "review");
@@ -867,7 +880,7 @@ function testRunStreamsProgressWhenOptedIn() {
       values,
       fixture,
       { MERGE_BASE: "base-sha", HEAD_SHA: "head-sha", REVIEW_TASK_TIMEOUT: "15", STREAM_PROGRESS: "true" },
-      { replaceResultPaths: true }
+      { initializeReviewOutputs: true }
     );
     assert.strictEqual(result.status, 0, `Run OpenCodeReview shell block failed; ${resultDescription(result)}`);
     const reviewCall = readJsonLines(fixture.callsPath).find((call) => call.args[0] === "review");
@@ -1282,7 +1295,7 @@ function testRunRetainsExtraHeadersEnvironmentOverride() {
       values,
       fixture,
       { MERGE_BASE: "base-sha", HEAD_SHA: "head-sha", REVIEW_TASK_TIMEOUT: values.review_task_timeout },
-      { replaceResultPaths: true }
+      { initializeReviewOutputs: true }
     );
     assert.strictEqual(result.status, 0, `Run OpenCodeReview shell block failed; ${resultDescription(result)}`);
     const reviewCall = readJsonLines(fixture.callsPath).find((call) => call.args[0] === "review");
@@ -1309,7 +1322,7 @@ function testRunFailsClosedWhenValidatedTaskTimeoutIsMissing() {
       values,
       fixture,
       { MERGE_BASE: "base-sha", HEAD_SHA: "head-sha", REVIEW_TASK_TIMEOUT: "" },
-      { replaceResultPaths: true }
+      { initializeReviewOutputs: true }
     );
     assert.notStrictEqual(result.status, 0, "Run OpenCodeReview must fail when validated timeout state is missing");
     assert.match(
@@ -1777,7 +1790,7 @@ function testCLIIsolationModelForwardingAndCredentialScope() {
         extraEnv.CLAUDE_CONFIG_DIR = claudeDir;
       }
       if (auth === "api-key") extraEnv.ANTHROPIC_API_KEY = "inherited-api-key-sentinel";
-      const reviewed = runStep(stepNamed("Run OpenCodeReview"), values, fixture, extraEnv, { replaceResultPaths: true });
+      const reviewed = runStep(stepNamed("Run OpenCodeReview"), values, fixture, extraEnv, { initializeReviewOutputs: true });
       assert.strictEqual(reviewed.status, 0, resultDescription(reviewed));
       const calls = readJsonLines(fixture.callsPath);
       assert.ok(calls.every((call) => call.executable === executable), "version/config/review must use exactly the selected executable");
@@ -1822,7 +1835,7 @@ function testHTTPAndCLIConditionalSettings() {
   try {
     const values = inputValues({ llm_url: "https://http.invalid", llm_model: "http-model", llm_auth_token: "http-token", claude_auth_token: "unused-gateway-token" });
     for (const step of [installStep(), stepNamed("Configure OCR"), stepNamed("Run OpenCodeReview")]) {
-      const result = runStep(step, values, fixture, { REVIEW_TASK_TIMEOUT: "15", MERGE_BASE: "base", HEAD_SHA: "head" }, { replaceResultPaths: true });
+      const result = runStep(step, values, fixture, { REVIEW_TASK_TIMEOUT: "15", MERGE_BASE: "base", HEAD_SHA: "head" }, { initializeReviewOutputs: true });
       assert.strictEqual(result.status, 0, resultDescription(result));
     }
     const calls = readJsonLines(fixture.callsPath);
@@ -1837,14 +1850,14 @@ function testHTTPAndCLIConditionalSettings() {
     assert.notStrictEqual(missingURL.status, 0);
     assert.match(missingURL.stdout, /llm_url is required/);
     const missingToken = runStep(stepNamed("Run OpenCodeReview"), { ...values, llm_auth_token: "" }, fixture,
-      { REVIEW_TASK_TIMEOUT: "15", MERGE_BASE: "base", HEAD_SHA: "head" }, { replaceResultPaths: true });
+      { REVIEW_TASK_TIMEOUT: "15", MERGE_BASE: "base", HEAD_SHA: "head" }, { initializeReviewOutputs: true });
     assert.notStrictEqual(missingToken.status, 0);
     assert.match(missingToken.stdout, /llm_auth_token is required/);
     const missingModel = runStep(stepNamed("Configure OCR"), { ...values, provider: "claude-code", llm_model: "" }, fixture);
     assert.notStrictEqual(missingModel.status, 0);
     assert.match(missingModel.stdout, /llm_model is required/);
     const missingHome = runStep(stepNamed("Run OpenCodeReview"), { ...values, provider: "claude-code" }, fixture,
-      { REVIEW_TASK_TIMEOUT: "15", MERGE_BASE: "base", HEAD_SHA: "head" }, { replaceResultPaths: true });
+      { REVIEW_TASK_TIMEOUT: "15", MERGE_BASE: "base", HEAD_SHA: "head" }, { initializeReviewOutputs: true });
     assert.notStrictEqual(missingHome.status, 0);
     assert.match(missingHome.stdout, /Isolated claude-code configuration is missing/);
   } finally {
@@ -1973,7 +1986,7 @@ function testCompletenessGatePrecedesPublication() {
   assert.ok(gate.index > stepNamed("Fail job on OCR error").index);
   assert.ok(gate.index < stepNamed("Post review comments").index);
   assert.match(gate.raw, /if: inputs\.require_complete == 'true' && env\.OCR_EXIT_CODE == '0'/);
-  assert.match(gate.run, /node "\$HELPER" \/tmp\/ocr-result\.json/);
+  assert.match(gate.run, /node "\$HELPER" "\$OCR_RESULT_PATH"/);
   for (const exitCode of [0, 1]) {
     const fixture = makeFixture();
     try {
@@ -1981,7 +1994,7 @@ function testCompletenessGatePrecedesPublication() {
       fs.mkdirSync(helperDir, { recursive: true });
       fs.writeFileSync(path.join(helperDir, "validate-review-result.js"), `process.exit(${exitCode});`);
       const result = runStep(gate, inputValues(), fixture,
-        { GITHUB_ACTION_PATH: path.join(fixture.dir, "trusted tooling") }, { replaceResultPaths: true });
+        { GITHUB_ACTION_PATH: path.join(fixture.dir, "trusted tooling") }, { initializeReviewOutputs: true });
       assert.strictEqual(result.status, exitCode, "validator failure must prevent posting");
     } finally {
       removeFixture(fixture);
@@ -1989,7 +2002,192 @@ function testCompletenessGatePrecedesPublication() {
   }
 }
 
+function artifactUploadAllowed(values, reviewFiles, review) {
+  const line = stepNamed("Upload review artifacts").raw.match(/^      if: \$\{\{ (.+) \}\}$/m);
+  assert.ok(line, "artifact upload must keep an explicit scoped step-output gate");
+  const evaluate = new Function("inputs", "steps", "always", `return ${line[1]};`);
+  return evaluate(values, { review_files: reviewFiles, review }, () => true);
+}
+
+function testOutputInitializationUsesPrivateScopedDirectories() {
+  const initialize = stepNamed("Initialize review outputs");
+  assert.match(initialize.raw, /id: review_files/);
+  assert.ok(initialize.index < stepNamed("Run OpenCodeReview").index);
+  assert.doesNotMatch(initialize.run, /GITHUB_ENV/, "output paths must not outlive the composite invocation as job environment");
+  assert.doesNotMatch(ACTION_TEXT, /\/tmp\/ocr-(?:result\.json|stderr\.log)/, "the action must never fall back to shared result files");
+  const fixture = makeFixture();
+  const directories = [];
+  try {
+    const runnerTemp = path.join(fixture.dir, "runner temporary files");
+    const tmpdir = path.join(fixture.dir, "fallback temporary files");
+    fs.mkdirSync(runnerTemp);
+    fs.mkdirSync(tmpdir);
+    for (const [env, root] of [
+      [{ RUNNER_TEMP: runnerTemp, TMPDIR: tmpdir }, runnerTemp],
+      [{ RUNNER_TEMP: "", TMPDIR: tmpdir }, tmpdir],
+      [{ RUNNER_TEMP: "", TMPDIR: "" }, "/tmp"],
+    ]) {
+      const outputs = initializeReviewOutputs(fixture, env);
+      directories.push(outputs.directory);
+      assert.strictEqual(path.dirname(outputs.directory), root);
+      assert.strictEqual(outputs.result_path, path.join(outputs.directory, "ocr-result.json"));
+      assert.strictEqual(outputs.stderr_path, path.join(outputs.directory, "ocr-stderr.log"));
+      assert.strictEqual(outputs.artifact_suffix, path.basename(outputs.directory));
+      assert.strictEqual(fs.statSync(outputs.directory).mode & 0o777, 0o700);
+      assert.deepStrictEqual(fs.readdirSync(outputs.directory), [], "initialization must not reuse any old result files");
+    }
+    assert.strictEqual(new Set(directories).size, 3);
+    for (const root of ["relative/tmp", `${runnerTemp}\nINJECTED=yes`, path.join(fixture.dir, "missing")]) {
+      const outputFile = path.join(fixture.dir, "failed-init-output");
+      fs.writeFileSync(outputFile, "");
+      const result = runShell(initialize.run, { RUNNER_TEMP: root, GITHUB_OUTPUT: outputFile }, fixture);
+      assert.notStrictEqual(result.status, 0, "invalid temporary roots must fail without publishing paths");
+      assert.deepStrictEqual(readEnvAssignments(outputFile), {});
+    }
+  } finally {
+    for (const directory of directories) fs.rmSync(directory, { recursive: true, force: true });
+    removeFixture(fixture);
+  }
+}
+
+function testRepeatedReviewsIsolateResultsLogsAndArtifacts() {
+  const fixture = makeFixture();
+  try {
+    const values = inputValues({ llm_model: "fixture-model", llm_auth_token: "fixture-token" });
+    const root = path.join(fixture.dir, "shared runner temp with spaces");
+    fs.mkdirSync(root);
+    const runs = [];
+    for (const label of ["first", "second"]) {
+      const outputs = initializeReviewOutputs(fixture, { RUNNER_TEMP: root });
+      const reviewOutputFile = path.join(fixture.dir, `${label}-review.out`);
+      const result = runStep(stepNamed("Run OpenCodeReview"), values, fixture, {
+        GITHUB_OUTPUT: reviewOutputFile,
+        REVIEW_TASK_TIMEOUT: "15", MERGE_BASE: "base", HEAD_SHA: "head",
+        OCR_FAKE_REVIEW_MESSAGE: `${label}-result-only`,
+        OCR_FAKE_REVIEW_STDERR: `${label}-stderr-only\n`,
+        STREAM_PROGRESS: label === "first" ? "false" : "true",
+      }, { stepOutputs: { review_files: outputs } });
+      assert.strictEqual(result.status, 0, resultDescription(result));
+      assert.strictEqual(readEnvAssignments(reviewOutputFile).started, "true");
+      assert.strictEqual(JSON.parse(fs.readFileSync(outputs.result_path, "utf8")).message, `${label}-result-only`);
+      assert.strictEqual(fs.readFileSync(outputs.stderr_path, "utf8"), `${label}-stderr-only\n`);
+      assert.strictEqual(fs.statSync(outputs.result_path).mode & 0o777, 0o600);
+      assert.ok(!fs.existsSync(path.join(outputs.directory, "stderr.fifo")), "streaming must remove its private FIFO after flushing");
+      const upload = stepNamed("Upload review artifacts");
+      const paths = upload.raw.match(/        path: \|\n((?:          .+\n)+)/)[1];
+      const rendered = resolveInputExpressions(paths, values, { review_files: outputs }).trim().split(/\n\s*/);
+      assert.deepStrictEqual(rendered, [outputs.result_path, outputs.stderr_path]);
+      const name = upload.raw.match(/^        name: (.+)$/m)[1]
+        .replace("${{ github.run_id }}", "same-run").replace("${{ github.run_attempt }}", "same-attempt");
+      runs.push({ outputs, artifactName: resolveInputExpressions(name, values, { review_files: outputs }) });
+      assert.strictEqual(artifactUploadAllowed(values, { outcome: "success", outputs }, { outputs: { started: "true" } }), true);
+    }
+    assert.notStrictEqual(runs[0].outputs.directory, runs[1].outputs.directory);
+    assert.notStrictEqual(runs[0].artifactName, runs[1].artifactName, "multiple invocations in one workflow must not collide in artifact storage");
+    assert.strictEqual(JSON.parse(fs.readFileSync(runs[0].outputs.result_path, "utf8")).message, "first-result-only");
+    assert.strictEqual(fs.readFileSync(runs[0].outputs.stderr_path, "utf8"), "first-stderr-only\n");
+    const jobEnv = readEnvAssignments(path.join(fixture.dir, "github-env"));
+    for (const name of ["OCR_OUTPUT_DIR", "OCR_RESULT_PATH", "OCR_STDERR_PATH"]) assert.strictEqual(jobEnv[name], undefined);
+  } finally {
+    removeFixture(fixture);
+  }
+}
+
+function testEarlyFailureCannotUploadPreviousResults() {
+  const fixture = makeFixture();
+  try {
+    const values = inputValues({ llm_model: "fixture-model", llm_auth_token: "fixture-token" });
+    const previous = initializeReviewOutputs(fixture);
+    fs.writeFileSync(previous.result_path, "previous sensitive result");
+    fs.writeFileSync(previous.stderr_path, "previous sensitive stderr");
+    const ambient = {
+      OCR_OUTPUT_DIR: previous.directory, OCR_RESULT_PATH: previous.result_path, OCR_STDERR_PATH: previous.stderr_path,
+      OCR_EXIT_CODE: "0", REVIEW_TASK_TIMEOUT: "15", MERGE_BASE: "base", HEAD_SHA: "head",
+    };
+    const run = stepNamed("Run OpenCodeReview");
+    const missingInitialization = runShell(run.run, { ...ambient, ...renderedEnv(run, values) }, fixture);
+    assert.notStrictEqual(missingInitialization.status, 0);
+    assert.match(missingInitialization.stdout, /Scoped review output paths are missing/);
+    assert.deepStrictEqual(readJsonLines(fixture.callsPath), []);
+    assert.strictEqual(artifactUploadAllowed(values, { outcome: "skipped", outputs: {} }, { outputs: {} }), false);
+    assert.strictEqual(artifactUploadAllowed(values, { outcome: "failure", outputs: {} }, { outputs: {} }), false);
+
+    const current = initializeReviewOutputs(fixture);
+    const reviewOutput = path.join(fixture.dir, "early-review.out");
+    const failedValidation = runStep(run, values, fixture, {
+      REVIEW_TASK_TIMEOUT: "", GITHUB_OUTPUT: reviewOutput,
+    }, { stepOutputs: { review_files: current } });
+    assert.notStrictEqual(failedValidation.status, 0);
+    assert.deepStrictEqual(readEnvAssignments(reviewOutput), {});
+    assert.deepStrictEqual(fs.readdirSync(current.directory), []);
+    assert.strictEqual(artifactUploadAllowed(values, { outcome: "success", outputs: current }, { outputs: readEnvAssignments(reviewOutput) }), false);
+    assert.strictEqual(fs.readFileSync(previous.result_path, "utf8"), "previous sensitive result");
+    assert.strictEqual(fs.readFileSync(previous.stderr_path, "utf8"), "previous sensitive stderr");
+
+    const failedReview = runStep(run, values, fixture, {
+      REVIEW_TASK_TIMEOUT: "15", MERGE_BASE: "base", HEAD_SHA: "head", GITHUB_OUTPUT: reviewOutput,
+      OCR_FAKE_REVIEW_STATUS: "7", OCR_FAKE_REVIEW_STDERR: "current review failed",
+    }, { stepOutputs: { review_files: current } });
+    assert.strictEqual(failedReview.status, 0, "the existing exit-code step still handles OCR failure after artifacts are uploaded");
+    assert.strictEqual(readEnvAssignments(path.join(fixture.dir, "github-env")).OCR_EXIT_CODE, "7");
+    assert.strictEqual(artifactUploadAllowed(values, { outcome: "success", outputs: current }, { outputs: readEnvAssignments(reviewOutput) }), true);
+    assert.strictEqual(artifactUploadAllowed({ ...values, upload_artifacts: "false" }, { outcome: "success", outputs: current }, { outputs: { started: "true" } }), false);
+    assert.strictEqual(fs.readFileSync(current.stderr_path, "utf8"), "current review failed");
+  } finally {
+    removeFixture(fixture);
+  }
+}
+
+async function testValidatorAndPublisherConsumeOnlyScopedOutputs() {
+  const fixture = makeFixture();
+  try {
+    const root = path.join(fixture.dir, "runner temp with spaces");
+    fs.mkdirSync(root);
+    const outputs = initializeReviewOutputs(fixture, { RUNNER_TEMP: root });
+    fs.writeFileSync(outputs.result_path, "current result only");
+    fs.writeFileSync(outputs.stderr_path, "current stderr only");
+    const gate = stepNamed("Validate complete review");
+    const post = stepNamed("Post review comments");
+    assert.strictEqual(gate.env.OCR_RESULT_PATH, "${{ steps.review_files.outputs.result_path }}");
+    assert.strictEqual(post.env.OCR_RESULT_PATH, "${{ steps.review_files.outputs.result_path }}");
+    assert.strictEqual(post.env.OCR_STDERR_PATH, "${{ steps.review_files.outputs.stderr_path }}");
+    const helperRoot = path.join(fixture.dir, "trusted helpers with spaces");
+    const helperDir = path.join(helperRoot, "scripts", "github-actions");
+    fs.mkdirSync(helperDir, { recursive: true });
+    fs.writeFileSync(path.join(helperDir, "validate-review-result.js"),
+      'process.stdout.write(JSON.stringify({path: process.argv[2], content: require("fs").readFileSync(process.argv[2], "utf8")}));');
+    const checked = runStep(gate, inputValues(), fixture, { GITHUB_ACTION_PATH: helperRoot }, { stepOutputs: { review_files: outputs } });
+    assert.strictEqual(checked.status, 0, resultDescription(checked));
+    assert.deepStrictEqual(JSON.parse(checked.stdout), { path: outputs.result_path, content: "current result only" });
+    const missing = runStep(gate, inputValues(), fixture, { GITHUB_ACTION_PATH: helperRoot });
+    assert.notStrictEqual(missing.status, 0, "validator must not fall back to any shared result when initialization was skipped");
+
+    const source = post.raw.split("        script: |\n")[1].split("\n").map((line) => line.slice(10)).join("\n")
+      .replace(/\$\{\{ inputs\.(sticky_summary|incremental|checkpoint_range) == 'true' \}\}/g, "false");
+    const execute = new (Object.getPrototypeOf(async function () {}).constructor)("require", "process", "core", "context", "github", source);
+    let published;
+    const requireFixture = (name) => name.endsWith("post-review-comments.js")
+      ? { runPostReviewComments: async (args) => { published = args; } }
+      : require(name);
+    await execute(requireFixture, { env: { GITHUB_ACTION_PATH: ROOT, OCR_RESULT_PATH: outputs.result_path, OCR_STDERR_PATH: outputs.stderr_path } }, {}, {}, {});
+    assert.strictEqual(published.resultPath, outputs.result_path);
+    assert.strictEqual(published.stderrPath, outputs.stderr_path);
+    published = undefined;
+    await assert.rejects(
+      execute(requireFixture, { env: { GITHUB_ACTION_PATH: ROOT } }, {}, {}, {}),
+      /Scoped review output paths are missing/
+    );
+    assert.strictEqual(published, undefined, "missing paths must never invoke the helper's shared-path defaults");
+  } finally {
+    removeFixture(fixture);
+  }
+}
+
 const TESTS = [
+  ["review outputs initialize in private per-invocation temporary directories", testOutputInitializationUsesPrivateScopedDirectories],
+  ["repeated reviews isolate result files, stderr, FIFOs and artifact names", testRepeatedReviewsIsolateResultsLogsAndArtifacts],
+  ["early failures never upload previous invocation artifacts", testEarlyFailureCannotUploadPreviousResults],
+  ["validation and publication consume only scoped output paths", testValidatorAndPublisherConsumeOnlyScopedOutputs],
   ["transport inputs validate before tools or checkout", testTransportInputsAndValidation],
   ["trusted preinstalled OCR bypasses npm and preserves version gates", testPreinstalledBinaryValidationAndVersionGates],
   ["CLI isolates settings, skips HTTP, forwards models and scopes authentication", testCLIIsolationModelForwardingAndCredentialScope],

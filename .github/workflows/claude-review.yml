@@ -11,6 +11,10 @@ on:
         description: Full commit SHA of the trusted OCR fork; pin the caller uses reference to the same SHA.
         type: string
         required: true
+      runner_labels:
+        description: JSON array of labels for a trusted Linux runner; use self-hosted only on a trusted runner pool.
+        type: string
+        default: '["ubuntu-latest"]'
       model:
         description: Claude CLI model; overrides the caller repository or organization OCR_MODEL variable.
         type: string
@@ -57,11 +61,19 @@ jobs:
       !github.event.pull_request.draft &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.type != 'Bot'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
     timeout-minutes: 30
     outputs:
       summary_comment_url: ${{ steps.review.outputs.summary_comment_url }}
     steps:
+      # Self-hosted machines need not have Node on PATH. Install the pinned
+      # runtime before using Node to validate inputs, without reading PR files.
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
       - name: Validate workflow configuration
         id: settings
         shell: bash
@@ -142,12 +154,6 @@ jobs:
           # no release tags (pushing those could trigger upstream publishing jobs).
           make build VERSION="v1.12.2+fork.${SOURCE_SHA}"
           ./dist/opencodereview --version
-
-      - name: Set up Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: '24'
-          package-manager-cache: false
 
       - name: Install pinned Claude Code
         working-directory: ${{ runner.temp }}
