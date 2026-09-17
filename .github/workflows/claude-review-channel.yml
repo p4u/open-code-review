@@ -53,10 +53,10 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.type != 'Bot'
     # Keep uses and source_sha pinned to the same commit when updating this channel.
-    uses: vocdoni/open-code-review/.github/workflows/claude-review.yml@e7dfc2e0f1cdbbd371d02acacc8b340dd1c6365b
+    uses: vocdoni/open-code-review/.github/workflows/claude-review.yml@3552061f7c4ea1d43e677c1a151b995935adf726
     with:
       source_repository: vocdoni/open-code-review
-      source_sha: e7dfc2e0f1cdbbd371d02acacc8b340dd1c6365b
+      source_sha: 3552061f7c4ea1d43e677c1a151b995935adf726
       runner_labels: ${{ inputs.runner_labels }}
       model: ${{ inputs.model }}
       gateway_url: ${{ inputs.gateway_url }}
