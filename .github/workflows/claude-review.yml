@@ -66,6 +66,20 @@ jobs:
     outputs:
       summary_comment_url: ${{ steps.review.outputs.summary_comment_url }}
     steps:
+      - name: Ensure runner HOME
+        shell: bash
+        run: |
+          # Preserve configured runner homes and their normal cache behavior.
+          if [[ -z "${HOME:-}" ]]; then
+            if [[ "${RUNNER_TEMP:-}" != /* || "${RUNNER_TEMP:-}" =~ [[:cntrl:]] ]]; then
+              printf '%s\n' 'RUNNER_TEMP must be an absolute path without control characters.' >&2
+              exit 1
+            fi
+            umask 077
+            runner_home="$(mktemp -d "$RUNNER_TEMP/ocr-runner-home.XXXXXX")"
+            printf 'HOME=%s\n' "$runner_home" >> "$GITHUB_ENV"
+          fi
+
       # Self-hosted machines need not have Node on PATH. Install the pinned
       # runtime before using Node to validate inputs, without reading PR files.
       - name: Set up Node.js

@@ -39,6 +39,7 @@ function fixture(fn) {
       RUNNER_TEMP: dir,
       GITHUB_OUTPUT: path.join(dir, "outputs"),
       GITHUB_PATH: path.join(dir, "paths"),
+      GITHUB_ENV: path.join(dir, "environment"),
       SOURCE_REPOSITORY: "p4u/open-code-review",
       SOURCE_SHA: "a".repeat(40),
       MODEL: "claude-gpt-6-astra",
@@ -59,6 +60,112 @@ function run(name, env, cwd = env.RUNNER_TEMP) {
 
 function executable(dir, name, content) {
   fs.writeFileSync(path.join(dir, name), `#!/bin/bash\nset -euo pipefail\n${content}\n`, { mode: 0o755 });
+}
+
+function testRunnerHomePreservesExistingHome() {
+  fixture((dir, env) => {
+    env.HOME = path.join(dir, "existing home");
+    fs.mkdirSync(env.HOME);
+    const sentinel = path.join(env.HOME, "existing-cache");
+    fs.writeFileSync(sentinel, "keep this cache");
+    fs.writeFileSync(env.GITHUB_ENV, "EXISTING=value\n");
+    const entries = fs.readdirSync(dir).sort();
+    for (const temp of [dir, undefined, "", "relative\ninvalid-temp"]) {
+      const existing = { ...env, RUNNER_TEMP: temp };
+      if (temp === undefined) delete existing.RUNNER_TEMP;
+      const result = run("Ensure runner HOME", existing, dir);
+      assert.strictEqual(result.status, 0, result.stderr);
+      assert.strictEqual(result.stdout, "");
+      assert.strictEqual(fs.readFileSync(env.GITHUB_ENV, "utf8"), "EXISTING=value\n", "a configured HOME must not be overridden");
+      assert.strictEqual(fs.readFileSync(sentinel, "utf8"), "keep this cache");
+      assert.deepStrictEqual(fs.readdirSync(dir).sort(), entries, "a configured HOME must not create a fallback");
+    }
+  });
+}
+
+function testRunnerHomeCreatesPrivateFallback() {
+  for (const home of [undefined, ""]) {
+    for (const name of ["runner-temp", "runner temp with spaces"]) {
+      fixture((dir, env) => {
+        env.RUNNER_TEMP = path.join(dir, name);
+        fs.mkdirSync(env.RUNNER_TEMP);
+        if (home === undefined) delete env.HOME;
+        else env.HOME = home;
+        fs.writeFileSync(env.GITHUB_ENV, "EXISTING=value\n");
+        const result = run("Ensure runner HOME", env);
+        assert.strictEqual(result.status, 0, result.stderr);
+        assert.strictEqual(result.stdout, "");
+        const output = fs.readFileSync(env.GITHUB_ENV, "utf8");
+        const match = output.match(/^EXISTING=value\nHOME=([^\n]+)\n$/);
+        assert(match, "fallback HOME must be appended as one environment entry");
+        const fallback = match[1];
+        assert(path.isAbsolute(fallback));
+        assert.strictEqual(path.dirname(fallback), env.RUNNER_TEMP);
+        assert(path.basename(fallback).startsWith("ocr-runner-home."));
+        const stat = fs.lstatSync(fallback);
+        assert(stat.isDirectory(), "fallback must be a directory, not a symlink");
+        assert.strictEqual(stat.mode & 0o777, 0o700, "fallback HOME must be private");
+        assert.deepStrictEqual(fs.readdirSync(env.RUNNER_TEMP), [path.basename(fallback)]);
+      });
+    }
+  }
+}
+
+function testRunnerHomeRejectsInvalidTempRoots() {
+  fixture((dir, env) => {
+    delete env.HOME;
+    const roots = [undefined, "", "relative temp", ...["\nINJECTED=value", "\r", "\t", "\x1b", "\x7f"].map(
+      (suffix) => path.join(dir, `runner-temp${suffix}`)
+    )];
+    for (const temp of roots) {
+      // Existing directories ensure failures come from validation, not mktemp.
+      if (temp) fs.mkdirSync(path.resolve(dir, temp));
+      const invalid = { ...env, RUNNER_TEMP: temp };
+      if (temp === undefined) delete invalid.RUNNER_TEMP;
+      const result = run("Ensure runner HOME", invalid, dir);
+      assert.strictEqual(result.status, 1, result.stderr);
+      assert(result.stderr.includes("RUNNER_TEMP must be an absolute path without control characters."));
+      assert.strictEqual(result.stdout, "");
+      assert(!fs.existsSync(env.GITHUB_ENV), "invalid temp roots must not emit HOME");
+      if (temp) assert.deepStrictEqual(fs.readdirSync(path.resolve(dir, temp)), []);
+    }
+  });
+}
+
+function testRunnerHomeFailsClosedWhenTempCreationFails() {
+  fixture((dir, env) => {
+    env.HOME = "";
+    const file = path.join(dir, "not-a-directory");
+    fs.writeFileSync(file, "not a temp root");
+    for (const temp of [file, path.join(dir, "missing-directory")]) {
+      const result = run("Ensure runner HOME", { ...env, RUNNER_TEMP: temp }, dir);
+      assert.strictEqual(result.status, 1, result.stderr);
+      assert.strictEqual(result.stdout, "");
+      assert(!fs.existsSync(env.GITHUB_ENV), "failed directory creation must not emit HOME");
+    }
+  });
+  fixture((dir, env) => {
+    env.HOME = "";
+    env.RUNNER_TEMP = path.join(dir, "read only temp");
+    fs.mkdirSync(env.RUNNER_TEMP, { mode: 0o500 });
+    // Root bypasses filesystem write permissions; simulate the same mktemp
+    // failure there so this regression remains deterministic in root containers.
+    if (process.getuid && process.getuid() === 0) {
+      const bin = path.join(dir, "bin");
+      fs.mkdirSync(bin);
+      executable(bin, "mktemp", "printf 'mktemp: Permission denied\\n' >&2; exit 1");
+      env.PATH = `${bin}:${env.PATH}`;
+    }
+    try {
+      const result = run("Ensure runner HOME", env, dir);
+      assert.strictEqual(result.status, 1, result.stderr);
+      assert.strictEqual(result.stdout, "");
+      assert(!fs.existsSync(env.GITHUB_ENV), "unwritable temp roots must not emit HOME");
+      assert.deepStrictEqual(fs.readdirSync(env.RUNNER_TEMP), []);
+    } finally {
+      fs.chmodSync(env.RUNNER_TEMP, 0o700);
+    }
+  });
 }
 
 function testConfigurationAndModelSelection() {
@@ -162,6 +269,13 @@ function testRunnerSelectionAndBootstrap() {
   assert(defaultLabels);
   assert.deepStrictEqual(JSON.parse(defaultLabels[1]), ["ubuntu-latest"], "existing callers keep the hosted default");
   assert(workflow.includes("runs-on: ${{ fromJSON(inputs.runner_labels) }}"));
+  assert.strictEqual(workflow.match(/^      - name: (.+)$/m)[1], "Ensure runner HOME", "HOME bootstrap must be the first step");
+  assert(step("Ensure runner HOME").includes("shell: bash"));
+  assert(script("Ensure runner HOME").includes("umask 077"));
+  assert.strictEqual(workflow.split("name: Ensure runner HOME").length - 1, 1);
+  for (const name of ["Set up Node.js", "Validate workflow configuration", "Checkout trusted review base", "Checkout pinned OCR tooling", "Set up Go"]) {
+    assert(workflow.indexOf("name: Ensure runner HOME") < workflow.indexOf(`name: ${name}`), `HOME must be ready before ${name}`);
+  }
   const node = step("Set up Node.js");
   assert(node.includes("node-version: '24'"));
   assert(node.includes("package-manager-cache: false"));
@@ -237,6 +351,10 @@ function testCallerExample() {
 }
 
 const tests = [
+  testRunnerHomePreservesExistingHome,
+  testRunnerHomeCreatesPrivateFallback,
+  testRunnerHomeRejectsInvalidTempRoots,
+  testRunnerHomeFailsClosedWhenTempCreationFails,
   testConfigurationAndModelSelection,
   testInvalidConfigurationFailsBeforeCheckout,
   testTrustedBootstrapAndCredentialScope,
