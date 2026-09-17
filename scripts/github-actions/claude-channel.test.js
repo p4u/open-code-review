@@ -22,7 +22,7 @@ const defaults = {
   review_concurrency: "1",
   llm_timeout: "300",
   review_task_timeout: "30",
-  max_tokens_budget: "500000",
+  max_tokens_budget: "1500000",
 };
 
 // Extract this workflow's block mappings without a YAML dependency. Keep nested

@@ -213,6 +213,9 @@ function testTimeoutInputsAndProgressForwarding() {
   }
   assert(review.includes("stream_progress: 'true'"), "the worker must stream provider failures into the console and stderr artifact");
   assert(review.includes("upload_artifacts: 'true'"));
+  assert.match(workflow, /^      max_tokens_budget:\n        description: [^\n]+\n        type: string\n        default: '1500000'$/m, "the finite central dispatch budget must accommodate measured GLM usage");
+  assert(review.includes("max_tokens_budget: ${{ inputs.max_tokens_budget }}"), "callers must retain their budget override");
+  assert(review.includes("require_complete: 'true'"), "larger budgets must not allow partial publication");
   assert.match(workflow, /^    timeout-minutes: 60$/m, "the finite job deadline must allow a 30-minute task plus other groups and setup");
   assert(review.includes("API_TIMEOUT_MS: '30000'"), "the gateway HTTP timeout must stay separate from OCR deadlines");
 }

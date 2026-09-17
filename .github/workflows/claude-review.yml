@@ -44,9 +44,9 @@ on:
         type: string
         default: '30'
       max_tokens_budget:
-        description: Total review token cap; an incomplete budget-limited review fails the check.
+        description: Aggregate token dispatch budget; active groups may finish above it, and incomplete reviews fail the check.
         type: string
-        default: '500000'
+        default: '1500000'
     secrets:
       gateway_token:
         description: Gateway credential passed only to the composite Action review step.
