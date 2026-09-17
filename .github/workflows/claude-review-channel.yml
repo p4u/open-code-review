@@ -1,0 +1,68 @@
+name: Claude Code PR review channel
+
+on:
+  workflow_call:
+    inputs:
+      runner_labels:
+        description: JSON array of labels for a trusted Linux runner; use self-hosted only on a trusted runner pool.
+        type: string
+        default: '["ubuntu-latest"]'
+      model:
+        description: Claude CLI model; overrides the caller repository or organization OCR_MODEL variable.
+        type: string
+        default: ''
+      gateway_url:
+        description: HTTPS gateway URL; falls back to the caller repository or organization OCR_GATEWAY_URL variable.
+        type: string
+        default: ''
+      claude_version:
+        description: Exact Claude Code npm version, not a moving tag or version range.
+        type: string
+        default: '2.1.273'
+      effort:
+        description: OCR review effort (low, medium, high).
+        type: string
+        default: low
+      review_concurrency:
+        description: Maximum parallel OCR review tasks within this run.
+        type: string
+        default: '1'
+      max_tokens_budget:
+        description: Total review token cap; an incomplete budget-limited review fails the check.
+        type: string
+        default: '500000'
+    secrets:
+      gateway_token:
+        description: Gateway credential passed only to the worker's review step.
+        required: true
+    outputs:
+      summary_comment_url:
+        description: URL of the PR review summary.
+        value: ${{ jobs.review.outputs.summary_comment_url }}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    # Only internal, human-authored, non-draft pull_request_target events may spend quota.
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type != 'Bot'
+    # Keep uses and source_sha pinned to the same commit when updating this channel.
+    uses: vocdoni/open-code-review/.github/workflows/claude-review.yml@e7dfc2e0f1cdbbd371d02acacc8b340dd1c6365b
+    with:
+      source_repository: vocdoni/open-code-review
+      source_sha: e7dfc2e0f1cdbbd371d02acacc8b340dd1c6365b
+      runner_labels: ${{ inputs.runner_labels }}
+      model: ${{ inputs.model }}
+      gateway_url: ${{ inputs.gateway_url }}
+      claude_version: ${{ inputs.claude_version }}
+      effort: ${{ inputs.effort }}
+      review_concurrency: ${{ inputs.review_concurrency }}
+      max_tokens_budget: ${{ inputs.max_tokens_budget }}
+    secrets:
+      gateway_token: ${{ secrets.gateway_token }}
